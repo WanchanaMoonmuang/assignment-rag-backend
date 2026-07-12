@@ -28,8 +28,10 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 60
     rag_min_score: float = 0.0
-    rag_top_k: int = Field(default=5, ge=1)
-    history_context_window: int = Field(default=8, ge=0)
+    rag_top_k: int = Field(default=5, ge=0, le=20)
+    history_context_window: int = Field(default=8, ge=0, le=100)
+    gemini_temperature: float = Field(default=0.2, ge=0.0, le=2.0)
+    generation_context_token_budget: int = Field(default=32_000, ge=1)
     max_document_bytes: int = Field(default=1_048_576, ge=1)
     rag_chunk_size: int = Field(default=900, ge=1)
     rag_chunk_overlap: int = Field(default=150, ge=0)

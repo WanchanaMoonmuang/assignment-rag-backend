@@ -17,6 +17,7 @@ from app.rag import (
     clamp_top_k,
     make_id,
     public_sources,
+    question_fits_budget,
     sse,
 )
 from app.schemas import ChatRequest, IngestRequest, LoginRequest
@@ -169,6 +170,8 @@ async def prepare_chat(
     db: Any,
     settings: Settings,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    if not question_fits_budget(payload.question, settings.generation_context_token_budget):
+        raise HTTPException(status_code=422, detail="Question exceeds the configured context budget")
     conversation = await ensure_conversation(db, settings, payload.conversation_id, payload.question)
     history_messages = history_context_messages(conversation, settings.history_context_window)
     await append_message(
@@ -188,6 +191,8 @@ async def retrieve_chunks(
     settings: Settings,
     gemini: GeminiClient,
 ) -> list[dict[str, Any]]:
+    if top_k == 0:
+        return []
     if not settings.mongodb_vector_index:
         raise HTTPException(status_code=500, detail="MONGODB_VECTOR_INDEX is not configured")
     [query_embedding] = await gemini.embed_texts([question])
@@ -238,11 +243,14 @@ async def completed_answer(
     gemini: GeminiClient,
     history_messages: list[dict[str, Any]],
 ) -> tuple[str, list[dict[str, Any]]]:
-    chunks = await retrieve_chunks(payload.question, clamp_top_k(payload.top_k, settings.rag_top_k), db, settings, gemini)
-    if not chunks:
-        return FALLBACK_ANSWER, []
-    answer = await gemini.generate(build_prompt(chunks, payload.question, history_messages))
-    return answer or FALLBACK_ANSWER, public_sources(chunks)
+    chunks = await retrieve_chunks(
+        payload.question, clamp_top_k(payload.top_k, settings.rag_top_k), db, settings, gemini
+    )
+    prompt, prompt_chunks = build_prompt(
+        chunks, payload.question, history_messages, settings.generation_context_token_budget
+    )
+    answer = await gemini.generate(prompt)
+    return answer or FALLBACK_ANSWER, public_sources(prompt_chunks)
 
 
 @router.get("/health")
@@ -456,17 +464,15 @@ async def stream_chat(
             chunks = await retrieve_chunks(
                 payload.question, clamp_top_k(payload.top_k, settings.rag_top_k), db, settings, gemini
             )
-            if not chunks:
-                answer = FALLBACK_ANSWER
-                yield sse("token", {"text": answer})
-                sources: list[dict[str, Any]] = []
-            else:
-                answer_parts: list[str] = []
-                async for token in gemini.stream(build_prompt(chunks, payload.question, history_messages)):
-                    answer_parts.append(token)
-                    yield sse("token", {"text": token})
-                answer = "".join(answer_parts).strip() or FALLBACK_ANSWER
-                sources = public_sources(chunks)
+            prompt, prompt_chunks = build_prompt(
+                chunks, payload.question, history_messages, settings.generation_context_token_budget
+            )
+            answer_parts: list[str] = []
+            async for token in gemini.stream(prompt):
+                answer_parts.append(token)
+                yield sse("token", {"text": token})
+            answer = "".join(answer_parts).strip() or FALLBACK_ANSWER
+            sources = public_sources(prompt_chunks)
             yield sse("sources", sources)
             await append_message(
                 db,

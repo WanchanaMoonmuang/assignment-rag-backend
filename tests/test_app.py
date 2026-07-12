@@ -9,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app, configure_gemini_client
-from app.rag import FALLBACK_ANSWER, GeminiClient, chunk_text
+from app.rag import SYSTEM_INSTRUCTION, GeminiClient, build_prompt, chunk_text, question_fits_budget
 from app.settings import Settings, get_settings
 
 
@@ -244,7 +244,7 @@ def test_gemini_developer_api_calls_disable_prompt_storage(monkeypatch: pytest.M
 
     install_fake_genai(monkeypatch, Client)
 
-    client = GeminiClient(Settings(gemini_provider="developer_api", gemini_api_key="key", _env_file=None))
+    client = GeminiClient(Settings(gemini_provider="developer_api", gemini_api_key="key", gemini_temperature=0.37, _env_file=None))
     assert asyncio.run(client.generate("prompt")) == "generated"
 
     async def collect_stream() -> list[str]:
@@ -254,6 +254,8 @@ def test_gemini_developer_api_calls_disable_prompt_storage(monkeypatch: pytest.M
     assert init_calls == [{"api_key": "key"}]
     assert calls[0]["store"] is False
     assert calls[1]["store"] is False
+    assert calls[0]["generation_config"]["temperature"] == 0.37
+    assert calls[1]["generation_config"]["temperature"] == 0.37
 
 
 def test_gemini_vertex_ai_uses_project_location_and_model_api(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -287,6 +289,7 @@ def test_gemini_vertex_ai_uses_project_location_and_model_api(monkeypatch: pytes
             gemini_provider="vertex_ai",
             google_cloud_project="project-1",
             google_cloud_location="asia-southeast1",
+            gemini_temperature=0.63,
         )
     )
     assert asyncio.run(client.embed_texts(["first", "second"])) == [[0.1], [0.1]]
@@ -302,6 +305,8 @@ def test_gemini_vertex_ai_uses_project_location_and_model_api(monkeypatch: pytes
     ]
     assert generate_calls[0]["contents"] == "prompt"
     assert stream_calls[0]["contents"] == "prompt"
+    assert generate_calls[0]["config"].kwargs["temperature"] == 0.63
+    assert stream_calls[0]["config"].kwargs["temperature"] == 0.63
 
 
 def test_gemini_client_requires_provider_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -504,7 +509,7 @@ def test_document_delete_rolls_back_if_metadata_delete_fails(client: TestClient)
     assert len(app.state.db["document_chunks"].docs) == 1
 
 
-def test_chat_fallback_creates_conversation(client: TestClient) -> None:
+def test_chat_without_retrieval_uses_foundation_answer(client: TestClient) -> None:
     response = client.post(
         "/api/chat",
         headers=auth_headers(client),
@@ -512,7 +517,7 @@ def test_chat_fallback_creates_conversation(client: TestClient) -> None:
     )
     assert response.status_code == 200
     body = response.json()
-    assert body["answer"] == FALLBACK_ANSWER
+    assert body["answer"] == "Generated answer."
     assert body["sources"] == []
     assert body["conversation_id"].startswith("conv_")
 
@@ -717,3 +722,69 @@ def test_stream_chat_event_order(client: TestClient) -> None:
     assert "event: token" in text
     assert "event: sources" in text
     assert "event: done" in text
+
+def test_chat_top_k_zero_skips_retrieval(client: TestClient) -> None:
+    response = client.post(
+        "/api/chat",
+        headers=auth_headers(client),
+        json={"question": "What is the refund policy?", "top_k": 0},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["answer"] == "Generated answer."
+    assert response.json()["sources"] == []
+    assert app.state.db["document_chunks"].last_pipeline is None
+
+
+def test_prompt_budget_discards_chunks_before_history() -> None:
+    chunks = [
+        {
+            "document_name": "first.txt",
+            "chunk_id": "chunk_1",
+            "content": "x" * 400,
+        },
+        {
+            "document_name": "second.txt",
+            "chunk_id": "chunk_2",
+            "content": "y" * 400,
+        },
+    ]
+    history = [
+        {"role": "user", "content": "Earlier request"},
+        {"role": "assistant", "content": "Latest answer"},
+    ]
+
+    prompt, retained_chunks = build_prompt(chunks, "Current question", history, token_budget=100)
+
+    assert retained_chunks == []
+    assert "Earlier request" in prompt
+    assert "Latest answer" in prompt
+
+
+def test_prompt_policy_requires_language_and_attribution() -> None:
+    assert "language of the user's latest question" in SYSTEM_INSTRUCTION
+    assert "inline markers" in SYSTEM_INSTRUCTION
+    assert "General knowledge" in SYSTEM_INSTRUCTION
+    assert "Do not claim that uncited general knowledge came from a document" in SYSTEM_INSTRUCTION
+
+
+def test_question_budget_is_unicode_safe() -> None:
+    assert not question_fits_budget("\U0001F600" * 30, token_budget=100)
+
+
+def test_chat_rejects_question_over_context_budget(client: TestClient) -> None:
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        auth_password="adminRAG123",
+        jwt_secret_key="test-secret-key-with-at-least-32-bytes",
+        mongodb_vector_index="test-index",
+        generation_context_token_budget=100,
+    )
+
+    response = client.post(
+        "/api/chat",
+        headers=auth_headers(client),
+        json={"question": "\U0001F600" * 30},
+    )
+
+    assert response.status_code == 422
+    assert app.state.db["conversations"].docs == {}

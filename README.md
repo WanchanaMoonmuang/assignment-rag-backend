@@ -29,6 +29,8 @@ Optional tuning values:
 
 - `RAG_TOP_K` default `5`
 - `HISTORY_CONTEXT_WINDOW` default `8`
+- `GEMINI_TEMPERATURE` default `0.2`
+- `GENERATION_CONTEXT_TOKEN_BUDGET` default `32000` (estimated tokens; retrieved chunks are removed before oldest history)
 - `RAG_CHUNK_SIZE` default `900`
 - `RAG_CHUNK_OVERLAP` default `150`
 

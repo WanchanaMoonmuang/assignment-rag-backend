@@ -25,7 +25,7 @@ class IngestRequest(BaseModel):
 class ChatRequest(BaseModel):
     conversation_id: str | None = None
     question: str = Field(min_length=1)
-    top_k: int | None = None
+    top_k: int | None = Field(default=None, ge=0, le=20)
 
     @field_validator("question")
     @classmethod
