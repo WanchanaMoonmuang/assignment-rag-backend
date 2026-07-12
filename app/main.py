@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import io
+import json
+from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator
+import zipfile
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, status
+from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
@@ -13,15 +17,15 @@ from app.rag import (
     FALLBACK_ANSWER,
     GeminiClient,
     build_prompt,
-    chunk_text,
     clamp_top_k,
     make_id,
     public_sources,
     question_fits_budget,
     sse,
 )
-from app.schemas import ChatRequest, IngestRequest, LoginRequest
+from app.schemas import ChatRequest, IngestRequest, IngestionTextRequest, LoginRequest
 from app.settings import Settings, get_settings
+from app.storage import delete_object, upload_object
 
 
 def now_utc() -> datetime:
@@ -91,6 +95,10 @@ def chunk_col(db: Any, settings: Settings) -> Any:
 
 def conv_col(db: Any, settings: Settings) -> Any:
     return db[settings.mongodb_conversation_collection]
+
+
+def job_col(db: Any, settings: Settings) -> Any:
+    return db[settings.mongodb_ingestion_job_collection]
 
 
 def serialize_document(document: dict[str, Any]) -> dict[str, Any]:
@@ -279,66 +287,177 @@ async def me(username: str = Depends(get_current_username)) -> dict[str, str]:
     return {"username": username}
 
 
-@router.post("/ingest")
+@router.post("/ingest", status_code=status.HTTP_202_ACCEPTED)
 async def ingest(
     payload: IngestRequest,
-    _: str = Depends(get_current_username),
+    username: str = Depends(get_current_username),
     db: Any = Depends(get_db),
-    gemini: GeminiClient = Depends(get_gemini),
     settings: Settings = Depends(get_settings),
 ) -> dict[str, Any]:
-    if len(payload.content.encode("utf-8")) > settings.max_document_bytes:
-        raise HTTPException(status_code=413, detail="Document content exceeds 1 MB limit")
+    return await create_text_ingestion(
+        IngestionTextRequest(
+            document_name=payload.document_name,
+            content=payload.content,
+            metadata=payload.metadata,
+        ),
+        username,
+        db,
+        settings,
+    )
 
-    chunks = chunk_text(payload.content, settings.rag_chunk_size, settings.rag_chunk_overlap)
-    embeddings = await gemini.embed_texts(chunks)
-    if len(embeddings) != len(chunks):
-        raise HTTPException(status_code=502, detail="Embedding count did not match chunk count")
 
-    metadata = payload.metadata or {}
-    source = metadata.get("source", "plain_text")
+def serialize_job(job: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "job_id": job["_id"],
+        "document_id": job["document_id"],
+        "document_name": job["document_name"],
+        "status": job["status"],
+        "stage": job.get("stage"),
+        "error": job.get("error"),
+    }
+
+
+def validated_content_type(suffix: str, data: bytes) -> str:
+    try:
+        if suffix == ".pdf":
+            if not data.startswith(b"%PDF-"):
+                raise ValueError
+            return "application/pdf"
+        if suffix == ".docx":
+            if not data.startswith(b"PK"):
+                raise ValueError
+            with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                if "word/document.xml" not in archive.namelist():
+                    raise ValueError
+            return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        if suffix == ".json":
+            json.loads(data.decode("utf-8-sig"))
+            return "application/json"
+        if suffix in {".txt", ".csv"}:
+            data.decode("utf-8-sig")
+            return "text/plain" if suffix == ".txt" else "text/csv"
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, zipfile.BadZipFile):
+        pass
+    raise HTTPException(status_code=415, detail="File content does not match its extension")
+
+
+def new_job(
+    document_id: str,
+    document_name: str,
+    source_kind: str,
+    metadata: dict[str, Any],
+    **values: Any,
+) -> dict[str, Any]:
     created_at = now_utc()
-    document_id = make_id("doc")
-    document = {
-        "_id": document_id,
-        "document_name": payload.document_name,
-        "source": source,
-        "chunks_count": len(chunks),
+    return {
+        "_id": make_id("job"),
+        "document_id": document_id,
+        "document_name": document_name,
+        "source_kind": source_kind,
         "metadata": metadata,
+        "status": "queued",
+        "stage": "queued",
+        "attempts": 0,
         "created_at": created_at,
         "updated_at": created_at,
+        **values,
     }
-    chunk_documents = [
-        {
-            "_id": make_id("chunk"),
-            "document_id": document_id,
-            "document_name": payload.document_name,
-            "chunk_index": index,
-            "content": chunk,
-            "embedding": embedding,
-            "metadata": metadata,
-            "created_at": created_at,
-        }
-        for index, (chunk, embedding) in enumerate(zip(chunks, embeddings), start=1)
-    ]
 
-    documents = doc_col(db, settings)
-    chunks_collection = chunk_col(db, settings)
-    session = await db.client.start_session()
+
+@router.post("/ingestions/text", status_code=status.HTTP_202_ACCEPTED)
+async def create_text_ingestion(
+    payload: IngestionTextRequest,
+    _: str = Depends(get_current_username),
+    db: Any = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> dict[str, Any]:
+    if len(payload.content.encode("utf-8")) > settings.max_upload_bytes:
+        raise HTTPException(status_code=413, detail="Document content exceeds 20 MiB limit")
+    if not payload.content.strip():
+        raise HTTPException(status_code=422, detail="Document content is required")
+
+    job = new_job(
+        make_id("doc"),
+        payload.document_name,
+        "text",
+        payload.metadata or {},
+        content=payload.content,
+    )
+    await job_col(db, settings).insert_one(job)
+    return serialize_job(job)
+
+
+@router.post("/ingestions/file", status_code=status.HTTP_202_ACCEPTED)
+async def create_file_ingestion(
+    file: UploadFile = File(...),
+    metadata_json: str | None = Form(default=None),
+    _: str = Depends(get_current_username),
+    db: Any = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> dict[str, Any]:
+    filename = Path(file.filename or "").name
+    if not filename:
+        raise HTTPException(status_code=422, detail="File name is required")
+    suffix = Path(filename).suffix.lower()
+    if suffix not in {".txt", ".pdf", ".docx", ".csv", ".json"}:
+        raise HTTPException(status_code=415, detail="Unsupported file type")
+
     try:
-        async with session:
-            async with session.start_transaction():
-                await documents.insert_one(document, session=session)
-                await chunks_collection.insert_many(chunk_documents, session=session)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail="Failed to ingest document") from exc
+        metadata = json.loads(metadata_json) if metadata_json else {}
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=422, detail="Metadata must be valid JSON") from exc
+    if not isinstance(metadata, dict):
+        raise HTTPException(status_code=422, detail="Metadata must be an object")
 
-    return {
-        "status": "success",
-        "document_id": document_id,
-        "document_name": payload.document_name,
-        "chunks_created": len(chunks),
-    }
+    data = await file.read(settings.max_upload_bytes + 1)
+    if len(data) > settings.max_upload_bytes:
+        raise HTTPException(status_code=413, detail="File exceeds 20 MiB limit")
+    content_type = validated_content_type(suffix, data)
+
+    document_id = make_id("doc")
+    object_name = f"originals/{document_id}/{filename}"
+    job = new_job(
+        document_id,
+        filename,
+        "file",
+        metadata,
+        object_name=object_name,
+        content_type=content_type,
+    )
+    await job_col(db, settings).insert_one(job)
+    try:
+        await upload_object(settings, object_name, data, content_type)
+    except Exception:
+        await job_col(db, settings).update_one(
+            {"_id": job["_id"]},
+            {
+                "$set": {
+                    "status": "failed",
+                    "stage": "failed",
+                    "error": {"code": "original_upload_failed", "message": "Original file upload failed"},
+                    "updated_at": now_utc(),
+                }
+            },
+        )
+        job["status"] = "failed"
+        job["stage"] = "failed"
+        job["error"] = {"code": "original_upload_failed", "message": "Original file upload failed"}
+        await schedule_cleanup(db, settings, document_id, filename, object_name)
+    return serialize_job(job)
+
+
+@router.get("/ingestions/{job_id}")
+async def get_ingestion_job(
+    job_id: str,
+    _: str = Depends(get_current_username),
+    db: Any = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> dict[str, Any]:
+    job = await job_col(db, settings).find_one({"_id": job_id})
+    if job is None:
+        raise HTTPException(status_code=404, detail="Ingestion job not found")
+    return serialize_job(job)
+
 
 
 @router.get("/documents")
@@ -352,6 +471,16 @@ async def list_documents(
     return {"documents": [serialize_document(document) for document in documents]}
 
 
+async def schedule_cleanup(
+    db: Any, settings: Settings, document_id: str, document_name: str, object_name: str
+) -> None:
+    job = new_job(document_id, document_name, "cleanup", {}, object_name=object_name)
+    job["status"] = "cleanup_pending"
+    job["stage"] = "cleanup"
+    job["cleanup_attempts"] = 0
+    await job_col(db, settings).insert_one(job)
+
+
 @router.delete("/documents/{document_id}")
 async def delete_document(
     document_id: str,
@@ -361,6 +490,7 @@ async def delete_document(
 ) -> dict[str, Any]:
     documents = doc_col(db, settings)
     chunks = chunk_col(db, settings)
+    cleanup_job: dict[str, Any] | None = None
     session = await db.client.start_session()
     try:
         async with session:
@@ -368,6 +498,15 @@ async def delete_document(
                 document = await documents.find_one({"_id": document_id}, session=session)
                 if document is None:
                     raise HTTPException(status_code=404, detail="Document not found")
+                object_name = document.get("original_object_name")
+                if object_name:
+                    cleanup_job = new_job(
+                        document_id, document["document_name"], "cleanup", {}, object_name=object_name
+                    )
+                    cleanup_job["status"] = "cleanup_pending"
+                    cleanup_job["stage"] = "cleanup"
+                    cleanup_job["cleanup_attempts"] = 0
+                    await job_col(db, settings).insert_one(cleanup_job, session=session)
                 deleted = await chunks.delete_many({"document_id": document_id}, session=session)
                 metadata_deleted = await documents.delete_one({"_id": document_id}, session=session)
                 if metadata_deleted.deleted_count != 1:
@@ -376,6 +515,16 @@ async def delete_document(
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail="Failed to delete document") from exc
+
+    if cleanup_job:
+        try:
+            await delete_object(settings, cleanup_job["object_name"])
+            await job_col(db, settings).update_one(
+                {"_id": cleanup_job["_id"], "status": "cleanup_pending"},
+                {"$set": {"status": "cleanup_completed", "updated_at": now_utc()}},
+            )
+        except Exception:
+            pass
     return {
         "status": "success",
         "document_id": document_id,
