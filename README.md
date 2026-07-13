@@ -27,6 +27,18 @@ For the PRD default demo account, set `AUTH_USERNAME=admin` and `AUTH_PASSWORD=a
 
 For Vertex AI, use application default credentials locally or the Cloud Run service account in deployment.
 
+## Cloud Run POC Deployment
+
+The image starts the API and ingestion worker in one container. Configure the
+Cloud Run service with always-allocated CPU, minimum instances `1`, and maximum
+instances `1`. Otherwise the worker can stop when there are no HTTP requests or
+multiple instances can needlessly poll the same job queue. Set `BACKEND_CORS_ORIGINS`
+to the deployed frontend origin, and grant the Cloud Run service account access to
+Vertex AI and the private GCS bucket.
+
+This is a POC deployment topology. Run the API and worker as separate services
+for production workloads.
+
 Optional tuning values:
 
 - `RAG_TOP_K` default `5`
