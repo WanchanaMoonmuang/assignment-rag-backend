@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from pymongo.errors import OperationFailure
 
 from app.main import app, configure_gemini_client
-from app.rag import SYSTEM_INSTRUCTION, GeminiClient, build_prompt, chunk_text, question_fits_budget
+from app.rag import SYSTEM_INSTRUCTION, GeminiClient, build_prompt, chunk_text, provider_usage, question_fits_budget
 from app.settings import Settings, get_settings
 from app.worker import claim_job, process_job
 
@@ -1202,3 +1202,69 @@ def test_stream_with_calculator_handles_multiple_calls() -> None:
     assert len(model_calls) == 2
     assert len(model_calls[1]["contents"][1]["parts"]) == 2
     assert len(model_calls[1]["contents"][2]["parts"]) == 2
+
+
+
+def test_chat_emits_redacted_metrics(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "app.main.emit", lambda event, **fields: events.append({"event": event, **fields})
+    )
+
+    secret_question = "private question: do not log this"
+    response = client.post(
+        "/api/chat",
+        headers=auth_headers(client),
+        json={"question": secret_question, "top_k": 3},
+    )
+
+    assert response.status_code == 200
+    metric = events[-1]
+    assert metric["event"] == "chat_metrics"
+    assert metric["status"] == "completed"
+    assert metric["input_tokens"] > 0
+    assert metric["output_tokens"] > 0
+    assert metric["request_total_ms"] >= 0
+    assert metric["token_source"] == "estimated"
+    assert secret_question not in str(metric)
+    assert "Generated answer." not in str(metric)
+
+
+def test_worker_emits_stage_and_job_metrics(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "app.worker.emit", lambda event, **fields: events.append({"event": event, **fields})
+    )
+    response = client.post(
+        "/api/ingestions/text",
+        headers=auth_headers(client),
+        json={"document_name": "private-policy.txt", "content": "private document text"},
+    )
+    job = app.state.db["ingestion_jobs"].docs[response.json()["job_id"]]
+    job.update({"status": "processing", "lease_token": "test-lease", "attempts": 1})
+
+    asyncio.run(process_job(app.state.db, app.dependency_overrides[get_settings](), app.state.gemini, job))
+
+    assert any(event["event"] == "worker_stage" and event["status"] == "started" for event in events)
+    job_metric = next(event for event in events if event["event"] == "worker_job")
+    assert job_metric["status"] == "completed"
+    assert job_metric["duration_ms"] >= 0
+    assert "private-policy.txt" not in str(events)
+    assert "private document text" not in str(events)
+
+
+
+def test_provider_usage_reads_reported_token_counts() -> None:
+    response = SimpleNamespace(
+        usage_metadata=SimpleNamespace(
+            prompt_token_count=11,
+            candidates_token_count=7,
+            total_token_count=18,
+        )
+    )
+
+    assert provider_usage(response) == {
+        "input_tokens": 11,
+        "output_tokens": 7,
+        "total_tokens": 18,
+    }

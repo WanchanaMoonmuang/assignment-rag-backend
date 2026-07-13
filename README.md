@@ -98,3 +98,17 @@ Create an Atlas Vector Search index on `MONGODB_CHUNK_COLLECTION` using
 Create an Atlas Search index named by `MONGODB_SEARCH_INDEX` using
 `docs/mongodb-search-index.json`. Retrieval combines equal-weight lexical and
 vector result sets with MongoDB `$rankFusion`, then applies the requested Top K.
+
+
+## Observability
+
+The API and worker write best-effort JSON events to standard output. Cloud Run captures
+these logs without a separate telemetry service. `chat_metrics` records request and
+retrieval, prompt-build, first-token, model-total, and request-total latency; it also
+records provider-reported input/output token counts when Gemini supplies them, otherwise estimates, and their `token_source`, effective Top K, retrieval
+count/scores, provider/model, tool names, and a safe error code when applicable.
+
+`worker_stage`, `worker_job`, and `worker_cleanup` record each ingestion transition,
+attempt, terminal status, safe error code, and duration. Events deliberately exclude
+chat text, prompts, answers, document names/content/chunks/metadata, calculator values,
+credentials, authorization headers, and raw provider tokens.

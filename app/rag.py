@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextvars import ContextVar
 from typing import Any, AsyncIterator
 from uuid import uuid4
 from app.calculator import CalculatorError, calculate
@@ -74,6 +75,24 @@ def estimated_tokens(text: str) -> int:
     return max(1, len(text.encode("utf-8")))
 
 
+
+def provider_usage(response: Any) -> dict[str, int] | None:
+    usage = getattr(response, "usage_metadata", None)
+    if usage is None:
+        return None
+    input_tokens = int(getattr(usage, "prompt_token_count", 0) or 0)
+    output_tokens = int(getattr(usage, "candidates_token_count", 0) or 0)
+    total_tokens = int(getattr(usage, "total_token_count", 0) or 0)
+    if total_tokens <= 0:
+        total_tokens = input_tokens + output_tokens
+    if total_tokens <= 0:
+        return None
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+    }
+
 def question_fits_budget(question: str, token_budget: int) -> bool:
     return estimated_tokens(_prompt_text([], question)) <= token_budget
 
@@ -144,6 +163,18 @@ class GeminiClient:
         else:
             raise RuntimeError("GEMINI_PROVIDER must be developer_api or vertex_ai")
         self._types = types
+        self._last_usage: ContextVar[dict[str, int] | None] = ContextVar("last_usage", default=None)
+
+    def _usage_context(self) -> ContextVar[dict[str, int] | None]:
+        context = getattr(self, "_last_usage", None)
+        if context is None:
+            context = ContextVar("last_usage", default=None)
+            self._last_usage = context
+        return context
+
+
+    def last_usage(self) -> dict[str, int] | None:
+        return self._usage_context().get()
 
     async def embed_texts(self, texts: list[str]) -> list[list[float]]:
         if not texts:
@@ -180,7 +211,9 @@ class GeminiClient:
         return (getattr(response, "text", "") or "").strip()
 
 
-    async def generate_with_calculator(self, prompt: str) -> tuple[str, list[dict[str, Any]]]:
+    async def generate_with_calculator(
+        self, prompt: str
+    ) -> tuple[str, list[dict[str, Any]], dict[str, int] | None]:
         activity: list[dict[str, Any]] = []
 
         def calculator(expression: str) -> dict[str, Any]:
@@ -202,7 +235,7 @@ class GeminiClient:
                 tools=[calculator],
             ),
         )
-        return (getattr(response, "text", "") or "").strip(), activity
+        return (getattr(response, "text", "") or "").strip(), activity, provider_usage(response)
 
 
     async def stream_with_calculator(self, prompt: str) -> AsyncIterator[tuple[str, Any]]:
@@ -220,6 +253,7 @@ class GeminiClient:
             temperature=self._settings.gemini_temperature,
             tools=[self._types.Tool(functionDeclarations=[declaration])],
         )
+        self._usage_context().set(None)
         stream = await asyncio.to_thread(
             self._client.models.generate_content_stream,
             model=self._settings.gemini_model,
@@ -231,6 +265,9 @@ class GeminiClient:
             chunk = await asyncio.to_thread(_next_or_none, iter(stream))
             if chunk is None:
                 break
+            usage = provider_usage(chunk)
+            if usage is not None:
+                self._usage_context().set(usage)
             if getattr(chunk, "text", None):
                 yield "token", chunk.text
             function_calls.extend(getattr(chunk, "function_calls", None) or [])
@@ -277,12 +314,16 @@ class GeminiClient:
             chunk = await asyncio.to_thread(_next_or_none, iter(follow_up))
             if chunk is None:
                 break
+            usage = provider_usage(chunk)
+            if usage is not None:
+                self._usage_context().set(usage)
             if getattr(chunk, "text", None):
                 yield "token", chunk.text
 
 
 
     async def stream(self, prompt: str) -> AsyncIterator[str]:
+        self._usage_context().set(None)
         stream = await asyncio.to_thread(
             self._client.models.generate_content_stream,
             model=self._settings.gemini_model,
@@ -293,6 +334,9 @@ class GeminiClient:
             chunk = await asyncio.to_thread(_next_or_none, iter(stream))
             if chunk is None:
                 break
+            usage = provider_usage(chunk)
+            if usage is not None:
+                self._usage_context().set(usage)
             if getattr(chunk, "text", None):
                 yield chunk.text
 
