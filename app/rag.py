@@ -7,11 +7,14 @@ from uuid import uuid4
 
 from app.settings import Settings
 
-FALLBACK_ANSWER = "The information is not available in the provided documents."
+FALLBACK_ANSWER = "I could not generate an answer. Please try again."
 SYSTEM_INSTRUCTION = (
-    "Answer the user's question using only the provided context. "
-    f'If the answer cannot be found in the context, say: "{FALLBACK_ANSWER}" '
-    "Do not make up information. Do not use outside knowledge. Keep the answer clear and concise."
+    "Answer in the language of the user's latest question. "
+    "When document context is provided, support document-based claims with inline markers "
+    "such as [1] that match the numbered sources. "
+    "You may use general knowledge when document context is incomplete, but put those claims "
+    "under a 'General knowledge' heading without source markers. "
+    "Do not claim that uncited general knowledge came from a document. Keep the answer clear and concise."
 )
 
 
@@ -20,7 +23,7 @@ def make_id(prefix: str) -> str:
 
 
 def clamp_top_k(value: int | None, default: int) -> int:
-    return min(max(value if value is not None else default, 3), 10)
+    return min(max(value if value is not None else default, 0), 20)
 
 
 def chunk_text(text: str, chunk_size: int, chunk_overlap: int) -> list[str]:
@@ -48,7 +51,7 @@ def format_chat_history(messages: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def build_prompt(
+def _prompt_text(
     chunks: list[dict[str, Any]],
     question: str,
     history_messages: list[dict[str, Any]] | None = None,
@@ -64,6 +67,36 @@ def build_prompt(
     sections.append(f"Context:\n{context}")
     sections.append(f"Question:\n{question}")
     return "\n\n".join(sections)
+
+
+def estimated_tokens(text: str) -> int:
+    return max(1, len(text.encode("utf-8")))
+
+
+def question_fits_budget(question: str, token_budget: int) -> bool:
+    return estimated_tokens(_prompt_text([], question)) <= token_budget
+
+
+def build_prompt(
+    chunks: list[dict[str, Any]],
+    question: str,
+    history_messages: list[dict[str, Any]] | None,
+    token_budget: int,
+) -> tuple[str, list[dict[str, Any]]]:
+    if not question_fits_budget(question, token_budget):
+        raise ValueError("Question exceeds the configured context budget")
+    selected_chunks = list(chunks)
+    selected_history = list(history_messages or [])
+    while True:
+        prompt = _prompt_text(selected_chunks, question, selected_history)
+        if estimated_tokens(prompt) <= token_budget or (
+            not selected_chunks and not selected_history
+        ):
+            return prompt, selected_chunks
+        if selected_chunks:
+            selected_chunks.pop()
+        else:
+            selected_history.pop(0)
 
 
 def public_sources(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -130,7 +163,7 @@ class GeminiClient:
     def _generate_content_config(self) -> Any:
         return self._types.GenerateContentConfig(
             system_instruction=SYSTEM_INSTRUCTION,
-            temperature=0.2,
+            temperature=self._settings.gemini_temperature,
         )
 
     async def generate(self, prompt: str) -> str:
@@ -148,7 +181,7 @@ class GeminiClient:
             model=self._settings.gemini_model,
             input=prompt,
             system_instruction=SYSTEM_INSTRUCTION,
-            generation_config={"temperature": 0.2},
+            generation_config={"temperature": self._settings.gemini_temperature},
             store=False,
         )
         return (getattr(interaction, "output_text", "") or "").strip()
@@ -174,7 +207,7 @@ class GeminiClient:
             model=self._settings.gemini_model,
             input=prompt,
             system_instruction=SYSTEM_INSTRUCTION,
-            generation_config={"temperature": 0.2},
+            generation_config={"temperature": self._settings.gemini_temperature},
             stream=True,
             store=False,
         )
