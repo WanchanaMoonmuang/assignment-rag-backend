@@ -272,3 +272,95 @@ curl -X DELETE "$BASE/conversations/$CONVERSATION_ID" \
 curl -X DELETE "$BASE/documents/$DOC_ID" \
   -H "Authorization: Bearer $TOKEN"
 ```
+
+## V2 Scope 1 and 2 Local Curl Result
+
+Run date: 2026-07-13  
+Backend process: `uvicorn app.main:app --host 0.0.0.0 --port 8080`  
+Worker process: `python -m app.worker`  
+Provider: Vertex AI, location `us`  
+Verified stacked commits: `55f96ff` generation and `1531539` durable ingestion.
+
+The configured project MongoDB collections were cleared before this scenario:
+
+```text
+documents: 4 deleted
+document_chunks: 5 deleted
+conversations: 2 deleted
+ingestion_jobs: 0 deleted
+```
+
+Authenticated curl scenario results:
+
+```text
+health=200 0.001028s
+unauthenticated documents=401 0.000906s
+authenticated current user=200 0.002748s
+POST /api/ingestions/text -> queued job
+worker terminal status=completed
+POST /api/chat top_k=0 -> sources=0
+POST /api/chat top_k=5 -> sources=1
+POST /api/chat/stream top_k=0 -> done event=1
+invalid top_k=21 -> 422
+mismatched PDF content -> 415
+deprecated POST /api/ingest -> queued
+DELETE test document -> success
+DELETE test conversation -> success
+```
+
+Functional status:
+
+- PASS: Vertex AI backend starts locally.
+- PASS: authentication, bearer rejection, and current-user API.
+- PASS: durable text ingestion, job polling, worker publication, and document cleanup.
+- PASS: Top K zero bypasses retrieval and returns no citations.
+- PASS: retrieved chat returns a source after Atlas indexing.
+- PASS: SSE returns a `done` event for no-retrieval chat.
+- PASS: request validation rejects Top K outside `0-20`.
+- PASS: file content that does not match a PDF signature is rejected before GCS upload/job creation.
+- PASS: the deprecated V1 ingestion endpoint now queues the V2 text-ingestion job.
+
+Not yet included in this run:
+
+- PDF, DOCX, CSV, and JSON conversion/extraction. Scope 3 is still in progress.
+- GCS successful-file upload and cleanup validation. A bucket named `poc-rag-58` is available and will be exercised once file extraction is connected.
+
+
+## 2026-07-13: Pre-merge Backend V2 Curl Validation
+
+Target: `feature/backend-v2-observability` (includes extraction, hybrid retrieval,
+generation, citations/tools, and observability). API: `http://127.0.0.1:8081`.
+
+Use the configured credentials without printing the bearer token:
+
+```bash
+set -a; source .env; set +a
+USER=${AUTH_USERNAME:-admin}
+TOKEN=$(curl -sS -X POST http://127.0.0.1:8081/api/auth/login \
+  -H "Content-Type: application/json" \
+  --data "{\"username\":\"$USER\",\"password\":\"$AUTH_PASSWORD\"}" \
+  | sed -n 's/.*\"access_token\":\"\([^\"]*\)\".*/\1/p')
+```
+
+| Scenario | Curl endpoint | Result | Latency |
+| --- | --- | --- | --- |
+| Health | `GET /api/health` | PASS: `200 {"status":"ok"}` | not captured |
+| Login | `POST /api/auth/login` | PASS: `200`; `.env` has a blank `AUTH_USERNAME`, so use `admin` fallback | 9 ms |
+| Runtime config | `GET /api/config` | PASS: `200`; Top K default `5`, range `0-20`, upload limit `20971520`, supported extensions returned | 6 ms |
+| Text ingestion | `POST /api/ingestions/text` then poll `GET /api/ingestions/{job_id}` | BLOCKED: enqueue returned `202` in 1.03 s; worker marked the job `failed` with safe `ingestion_failed` | n/a |
+| Non-stream chat | `POST /api/chat` with `top_k: 0` | BLOCKED: API returned `500 Internal Server Error` in 374 ms | 374 ms |
+| Direct Vertex basic generation | local `GeminiClient.generate` | PASS: returned a response | n/a |
+| Direct Vertex calculator generation | local `GeminiClient.generate_with_calculator` | PASS: returned a response and provider usage `{input_tokens: 102, output_tokens: 9, total_tokens: 111}` | n/a |
+
+Not executed because ingestion and API chat are blocked: file ingestion completion, hybrid retrieval answer/sources, citation chunk lookup, SSE chat events, and calculator SSE events.
+
+### Pre-merge blockers
+
+1. Capture the current API/worker traceback for the `POST /api/chat` 500 and worker
+   `ingestion_failed`; both hide their internal error by design in the API response.
+2. `uv run python -m app.check_config` incorrectly requires `GEMINI_API_KEY` when
+   `GEMINI_PROVIDER=vertex_ai`; direct Vertex generation proves the configured ADC
+   credentials and model access are working.
+
+Do not merge the remaining V2 backend branches as validated until these two failures
+are resolved and this curl matrix is rerun.
