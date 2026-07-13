@@ -6,6 +6,7 @@ import json
 from urllib.parse import quote
 from pathlib import Path
 from datetime import datetime, timezone
+from time import perf_counter
 from typing import Any, AsyncIterator
 import zipfile
 
@@ -14,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from pymongo.errors import OperationFailure
 
+from app.observability import emit
 from app.auth import create_access_token, credentials_match, get_current_username
 from app.rag import (
     FALLBACK_ANSWER,
@@ -22,6 +24,7 @@ from app.rag import (
     clamp_top_k,
     make_id,
     public_sources,
+    estimated_tokens,
     question_fits_budget,
     sse,
 )
@@ -273,11 +276,15 @@ async def retrieve_chunks(
 async def generate_answer(
     gemini: GeminiClient,
     prompt: str,
-) -> tuple[str, list[dict[str, Any]]]:
+) -> tuple[str, list[dict[str, Any]], dict[str, int] | None]:
     generate_with_calculator = getattr(gemini, "generate_with_calculator", None)
     if generate_with_calculator is None:
-        return await gemini.generate(prompt), []
-    return await generate_with_calculator(prompt)
+        return await gemini.generate(prompt), [], None
+    result = await generate_with_calculator(prompt)
+    if len(result) == 3:
+        return result
+    answer, activity = result
+    return answer, activity, None
 
 
 
@@ -287,15 +294,36 @@ async def completed_answer(
     settings: Settings,
     gemini: GeminiClient,
     history_messages: list[dict[str, Any]],
-) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    started = perf_counter()
     chunks = await retrieve_chunks(
         payload.question, clamp_top_k(payload.top_k, settings.rag_top_k), db, settings, gemini
     )
+    retrieval_ms = (perf_counter() - started) * 1000
+    started = perf_counter()
     prompt, prompt_chunks = build_prompt(
         chunks, payload.question, history_messages, settings.generation_context_token_budget
     )
-    answer, tool_activity = await generate_answer(gemini, prompt)
-    return answer or FALLBACK_ANSWER, public_sources(prompt_chunks), tool_activity
+    prompt_build_ms = (perf_counter() - started) * 1000
+    started = perf_counter()
+    answer, tool_activity, usage = await generate_answer(gemini, prompt)
+    model_ms = (perf_counter() - started) * 1000
+    answer = answer or FALLBACK_ANSWER
+    tokens = usage or {
+        "input_tokens": estimated_tokens(prompt),
+        "output_tokens": estimated_tokens(answer),
+        "total_tokens": estimated_tokens(prompt) + estimated_tokens(answer),
+    }
+    return answer, public_sources(prompt_chunks), tool_activity, {
+        "retrieval_ms": round(retrieval_ms, 2),
+        "prompt_build_ms": round(prompt_build_ms, 2),
+        "model_first_token_ms": None,
+        "model_total_ms": round(model_ms, 2),
+        **tokens,
+        "token_source": "provider" if usage else "estimated",
+        "retrieved_chunks": len(chunks),
+        "scores": [chunk["score"] for chunk in chunks],
+    }
 
 
 @router.get("/health")
@@ -693,16 +721,51 @@ async def chat(
     gemini: GeminiClient = Depends(get_gemini),
     settings: Settings = Depends(get_settings),
 ) -> dict[str, Any]:
-    conversation, history_messages = await prepare_chat(payload, db, settings)
-    answer, sources, tool_activity = await completed_answer(payload, db, settings, gemini, history_messages)
-    await append_message(
-        db,
-        settings,
-        conversation["_id"],
-        {"role": "assistant", "content": answer, "sources": sources, "tool_activity": tool_activity, "created_at": now_utc()},
-        answer,
-    )
-    return {"conversation_id": conversation["_id"], "answer": answer, "sources": sources, "tool_activity": tool_activity}
+    request_started = perf_counter()
+    request_id = make_id("req")
+    effective_top_k = clamp_top_k(payload.top_k, settings.rag_top_k)
+    conversation_id: str | None = None
+    try:
+        conversation, history_messages = await prepare_chat(payload, db, settings)
+        conversation_id = conversation["_id"]
+        answer, sources, tool_activity, metrics = await completed_answer(
+            payload, db, settings, gemini, history_messages
+        )
+        await append_message(
+            db,
+            settings,
+            conversation_id,
+            {"role": "assistant", "content": answer, "sources": sources, "tool_activity": tool_activity, "created_at": now_utc()},
+            answer,
+        )
+        emit(
+            "chat_metrics",
+            request_id=request_id,
+            conversation_id=conversation_id,
+            provider=settings.gemini_provider,
+            model=settings.gemini_model,
+            requested_top_k=payload.top_k,
+            effective_top_k=effective_top_k,
+            tool_names=[item.get("name") for item in tool_activity],
+            request_total_ms=round((perf_counter() - request_started) * 1000, 2),
+            status="completed",
+            **metrics,
+        )
+        return {"request_id": request_id, "conversation_id": conversation_id, "answer": answer, "sources": sources, "tool_activity": tool_activity}
+    except Exception:
+        emit(
+            "chat_metrics",
+            request_id=request_id,
+            conversation_id=conversation_id,
+            provider=settings.gemini_provider,
+            model=settings.gemini_model,
+            requested_top_k=payload.top_k,
+            effective_top_k=effective_top_k,
+            request_total_ms=round((perf_counter() - request_started) * 1000, 2),
+            status="failed",
+            error_code="chat_failed",
+        )
+        raise
 
 
 @router.post("/chat/stream")
@@ -713,33 +776,53 @@ async def stream_chat(
     gemini: GeminiClient = Depends(get_gemini),
     settings: Settings = Depends(get_settings),
 ) -> StreamingResponse:
-    conversation, history_messages = await prepare_chat(payload, db, settings)
+    request_started = perf_counter()
     request_id = make_id("req")
     effective_top_k = clamp_top_k(payload.top_k, settings.rag_top_k)
-
-    async def events() -> AsyncIterator[str]:
-        yield sse(
-            "conversation",
-            {"conversation_id": conversation["_id"], "title": conversation["title"]},
+    try:
+        conversation, history_messages = await prepare_chat(payload, db, settings)
+    except Exception:
+        emit(
+            "chat_metrics",
+            request_id=request_id,
+            conversation_id=None,
+            provider=settings.gemini_provider,
+            model=settings.gemini_model,
+            requested_top_k=payload.top_k,
+            effective_top_k=effective_top_k,
+            request_total_ms=round((perf_counter() - request_started) * 1000, 2),
+            status="failed",
+            error_code="chat_preparation_failed",
         )
+        raise
+    async def events() -> AsyncIterator[str]:
+        yield sse("conversation", {"conversation_id": conversation["_id"], "title": conversation["title"]})
         yield sse("metadata", {"request_id": request_id, "top_k": effective_top_k})
         try:
-            chunks = await retrieve_chunks(
-                payload.question, effective_top_k, db, settings, gemini
-            )
+            retrieval_started = perf_counter()
+            chunks = await retrieve_chunks(payload.question, effective_top_k, db, settings, gemini)
+            retrieval_ms = (perf_counter() - retrieval_started) * 1000
+            prompt_started = perf_counter()
             prompt, prompt_chunks = build_prompt(
                 chunks, payload.question, history_messages, settings.generation_context_token_budget
             )
+            prompt_build_ms = (perf_counter() - prompt_started) * 1000
+            model_started = perf_counter()
+            first_token_ms: float | None = None
             tool_activity: list[dict[str, Any]] = []
             answer_parts: list[str] = []
             stream_with_calculator = getattr(gemini, "stream_with_calculator", None)
             if stream_with_calculator is None:
                 async for token in gemini.stream(prompt):
+                    if first_token_ms is None:
+                        first_token_ms = (perf_counter() - model_started) * 1000
                     answer_parts.append(token)
                     yield sse("token", {"text": token})
             else:
                 async for event, data in stream_with_calculator(prompt):
                     if event == "token":
+                        if first_token_ms is None:
+                            first_token_ms = (perf_counter() - model_started) * 1000
                         answer_parts.append(data)
                         yield sse("token", {"text": data})
                     else:
@@ -747,17 +830,26 @@ async def stream_chat(
                         yield sse(event, data)
             answer = "".join(answer_parts).strip() or FALLBACK_ANSWER
             sources = public_sources(prompt_chunks)
-            yield sse("sources", sources)
+            usage = getattr(gemini, "last_usage", None)
+            if callable(usage):
+                usage = usage()
+            tokens = usage or {
+                "input_tokens": estimated_tokens(prompt),
+                "output_tokens": estimated_tokens(answer),
+                "total_tokens": estimated_tokens(prompt) + estimated_tokens(answer),
+            }
             await append_message(
-                db,
-                settings,
-                conversation["_id"],
+                db, settings, conversation["_id"],
                 {"role": "assistant", "content": answer, "sources": sources, "tool_activity": tool_activity, "created_at": now_utc()},
                 answer,
             )
+            emit("chat_metrics", request_id=request_id, conversation_id=conversation["_id"], provider=settings.gemini_provider, model=settings.gemini_model, requested_top_k=payload.top_k, effective_top_k=effective_top_k, retrieved_chunks=len(chunks), scores=[chunk["score"] for chunk in chunks], tool_names=[item.get("name") for item in tool_activity], retrieval_ms=round(retrieval_ms, 2), prompt_build_ms=round(prompt_build_ms, 2), model_first_token_ms=round(first_token_ms if first_token_ms is not None else (perf_counter() - model_started) * 1000, 2), model_total_ms=round((perf_counter() - model_started) * 1000, 2), request_total_ms=round((perf_counter() - request_started) * 1000, 2), **tokens, token_source="provider" if usage else "estimated", status="completed")
+            yield sse("sources", sources)
             yield sse("done", {"status": "completed"})
         except Exception:
+            emit("chat_metrics", request_id=request_id, conversation_id=conversation["_id"], provider=settings.gemini_provider, model=settings.gemini_model, effective_top_k=effective_top_k, request_total_ms=round((perf_counter() - request_started) * 1000, 2), status="failed", error_code="generation_failed")
             yield sse("error", {"message": "Unable to generate response"})
+
 
     return StreamingResponse(events(), media_type="text/event-stream")
 

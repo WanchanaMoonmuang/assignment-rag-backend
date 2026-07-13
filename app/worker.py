@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import suppress
+from time import perf_counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from pymongo import ReturnDocument
 
+from app.observability import emit
 from app.extraction import ExtractedChunk, ExtractionError, extract, extract_text
 from app.rag import GeminiClient, make_id
 from app.settings import Settings, get_settings
@@ -107,7 +109,7 @@ async def claim_job(db: Any, settings: Settings, worker_id: str) -> dict[str, An
     jobs = db[settings.mongodb_ingestion_job_collection]
     now = now_utc()
     await terminalize_expired_jobs(db, settings, now)
-    return await jobs.find_one_and_update(
+    job = await jobs.find_one_and_update(
         {
             "$or": [
                 {"status": "queued"},
@@ -132,6 +134,16 @@ async def claim_job(db: Any, settings: Settings, worker_id: str) -> dict[str, An
         sort=[("created_at", 1)],
         return_document=ReturnDocument.AFTER,
     )
+    if job is not None:
+        emit(
+            "worker_stage",
+            job_id=job["_id"],
+            stage=job.get("stage"),
+            attempt=job.get("attempts"),
+            worker_id=worker_id,
+            status="claimed",
+        )
+    return job
 
 async def renew_lease(db: Any, settings: Settings, job: dict[str, Any]) -> None:
     jobs = db[settings.mongodb_ingestion_job_collection]
@@ -150,11 +162,25 @@ async def renew_lease(db: Any, settings: Settings, job: dict[str, Any]) -> None:
         if result.modified_count != 1:
             return
 
-
 async def set_stage(db: Any, settings: Settings, job: dict[str, Any], stage: str) -> None:
-    await db[settings.mongodb_ingestion_job_collection].update_one(
+    started = job.get("_metric_stage_started", perf_counter())
+    result = await db[settings.mongodb_ingestion_job_collection].update_one(
         job_filter(job), {"$set": {"stage": stage, "updated_at": now_utc()}}
     )
+    if result.modified_count != 1:
+        raise RuntimeError("Ingestion lease was lost")
+    previous_stage = job.get("stage")
+    job["stage"] = stage
+    emit(
+        "worker_stage",
+        job_id=job["_id"],
+        stage=previous_stage,
+        next_stage=stage,
+        attempt=job.get("attempts"),
+        duration_ms=round((perf_counter() - started) * 1000, 2),
+        status="completed",
+    )
+    job["_metric_stage_started"] = perf_counter()
 
 
 async def publish_job(
@@ -276,6 +302,9 @@ async def process_file_job(db: Any, settings: Settings, gemini: GeminiClient, jo
 
 
 async def process_job(db: Any, settings: Settings, gemini: GeminiClient, job: dict[str, Any]) -> None:
+    job["_metric_job_started"] = perf_counter()
+    job["_metric_stage_started"] = perf_counter()
+    emit("worker_stage", job_id=job["_id"], stage=job.get("stage"), attempt=job.get("attempts"), status="started")
     heartbeat = asyncio.create_task(renew_lease(db, settings, job))
     try:
         try:
@@ -291,16 +320,17 @@ async def process_job(db: Any, settings: Settings, gemini: GeminiClient, job: di
         except Exception:
             error = {"code": "ingestion_failed", "message": "Unable to process ingestion"}
         else:
+            emit("worker_stage", job_id=job["_id"], stage=job.get("stage"), attempt=job.get("attempts"), duration_ms=round((perf_counter() - job["_metric_stage_started"]) * 1000, 2), status="completed")
+            emit("worker_job", job_id=job["_id"], attempt=job.get("attempts"), status="completed", duration_ms=round((perf_counter() - job["_metric_job_started"]) * 1000, 2))
             return
 
         await mark_job_failed(
-            db,
-            settings,
-            job,
-            error,
+            db, settings, job, error,
             int(job.get("attempts") or 0) >= settings.ingestion_job_max_attempts,
             job_filter(job),
         )
+        emit("worker_stage", job_id=job["_id"], stage=job.get("stage"), attempt=job.get("attempts"), duration_ms=round((perf_counter() - job["_metric_stage_started"]) * 1000, 2), status="failed", error_code=error["code"])
+        emit("worker_job", job_id=job["_id"], attempt=job.get("attempts"), status="failed", error_code=error["code"], duration_ms=round((perf_counter() - job["_metric_job_started"]) * 1000, 2))
     finally:
         heartbeat.cancel()
         with suppress(asyncio.CancelledError):
@@ -311,26 +341,21 @@ async def sweep_cleanup(db: Any, settings: Settings) -> None:
     cursor = jobs.find({"status": "cleanup_pending"})
     for job in await cursor.to_list(length=50):
         attempts = int(job.get("cleanup_attempts") or 0) + 1
+        started = perf_counter()
         try:
             await delete_object(settings, job["object_name"])
             await jobs.update_one(
                 {"_id": job["_id"], "status": "cleanup_pending"},
                 {"$set": {"status": "cleanup_completed", "updated_at": now_utc()}},
             )
+            emit("worker_cleanup", job_id=job["_id"], attempt=attempts, status="completed", duration_ms=round((perf_counter() - started) * 1000, 2))
         except Exception:
             terminal = attempts >= 10
-            if terminal:
-                logger.error("gcs_cleanup_failed job_id=%s attempts=%s", job["_id"], attempts)
             await jobs.update_one(
                 {"_id": job["_id"], "status": "cleanup_pending"},
-                {
-                    "$set": {
-                        "status": "cleanup_failed" if terminal else "cleanup_pending",
-                        "cleanup_attempts": attempts,
-                        "updated_at": now_utc(),
-                    }
-                },
+                {"$set": {"status": "cleanup_failed" if terminal else "cleanup_pending", "cleanup_attempts": attempts, "updated_at": now_utc()}},
             )
+            emit("worker_cleanup", job_id=job["_id"], attempt=attempts, status="failed" if terminal else "retrying", error_code="cleanup_failed", duration_ms=round((perf_counter() - started) * 1000, 2))
 
 
 async def run() -> None:
