@@ -14,6 +14,7 @@ async def check() -> int:
             "MONGODB_URI": settings.mongodb_uri,
             "MONGODB_DATABASE": settings.mongodb_database,
             "MONGODB_VECTOR_INDEX": settings.mongodb_vector_index,
+            "MONGODB_SEARCH_INDEX": settings.mongodb_search_index,
             "JWT_SECRET_KEY": settings.jwt_secret_key,
             "AUTH_PASSWORD": settings.auth_password,
         }.items()
@@ -34,6 +35,13 @@ async def check() -> int:
     if not any(index.get("name") == settings.mongodb_vector_index for index in indexes):
         print(
             f"Vector index {settings.mongodb_vector_index!r} not found on "
+            f"{settings.mongodb_chunk_collection!r}"
+        )
+        return 1
+
+    if not any(index.get("name") == settings.mongodb_search_index for index in indexes):
+        print(
+            f"Search index {settings.mongodb_search_index!r} not found on "
             f"{settings.mongodb_chunk_collection!r}"
         )
         return 1

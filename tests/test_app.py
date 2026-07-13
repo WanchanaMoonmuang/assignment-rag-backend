@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from pymongo.errors import OperationFailure
 
 from app.main import app, configure_gemini_client
 from app.rag import SYSTEM_INSTRUCTION, GeminiClient, build_prompt, chunk_text, question_fits_budget
@@ -33,6 +34,7 @@ class Collection:
         self.docs: dict[str, dict[str, Any]] = {}
         self.aggregate_rows: list[dict[str, Any]] = []
         self.last_pipeline: list[dict[str, Any]] | None = None
+        self.fail_aggregate = False
         self.fail_delete_many = False
         self.fail_delete_one = False
         self.fail_insert_many = False
@@ -108,6 +110,8 @@ class Collection:
 
     def aggregate(self, pipeline: list[dict[str, Any]]) -> Cursor:
         self.last_pipeline = deepcopy(pipeline)
+        if self.fail_aggregate:
+            raise OperationFailure("search index unavailable")
         return Cursor(deepcopy(self.aggregate_rows))
 
 
@@ -198,7 +202,6 @@ def client() -> TestClient:
         auth_password="adminRAG123",
         jwt_secret_key="test-secret-key-with-at-least-32-bytes",
         mongodb_vector_index="test-index",
-        rag_min_score=0.5,
     )
     app.dependency_overrides[get_settings] = lambda: settings
     with TestClient(app) as test_client:
@@ -564,8 +567,13 @@ def test_chat_uses_env_default_top_k(client: TestClient) -> None:
         json={"question": "What is the refund policy?"},
     )
     assert response.status_code == 200
-    vector_stage = app.state.db["document_chunks"].last_pipeline[0]["$vectorSearch"]
-    assert vector_stage["limit"] == 7
+    rank_fusion = next(iter(app.state.db["document_chunks"].last_pipeline[0].values()))
+    pipelines = rank_fusion["input"]["pipelines"]
+    vector_stage = next(iter(pipelines["vector"][0].values()))
+    assert vector_stage["limit"] == 28
+    lexical_stage = next(iter(pipelines["lexical"][0].values()))
+    assert lexical_stage["text"]["path"] == "content"
+    assert list(app.state.db["document_chunks"].last_pipeline[1].values()) == [7]
 
 
 def test_chat_returns_sources_when_context_matches(client: TestClient) -> None:
@@ -661,7 +669,6 @@ def test_chat_prompt_respects_history_context_window(client: TestClient) -> None
         auth_password="adminRAG123",
         jwt_secret_key="test-secret-key-with-at-least-32-bytes",
         mongodb_vector_index="test-index",
-        rag_min_score=0.5,
         history_context_window=1,
     )
     app.state.db["document_chunks"].aggregate_rows = [
@@ -699,7 +706,6 @@ def test_chat_prompt_omits_history_when_window_is_zero(client: TestClient) -> No
         auth_password="adminRAG123",
         jwt_secret_key="test-secret-key-with-at-least-32-bytes",
         mongodb_vector_index="test-index",
-        rag_min_score=0.5,
         history_context_window=0,
     )
     app.state.db["document_chunks"].aggregate_rows = [
@@ -1063,3 +1069,54 @@ def test_terminal_file_failure_records_cleanup_atomically(
         item["status"] == "cleanup_pending"
         for item in app.state.db["ingestion_jobs"].docs.values()
     )
+
+def test_config_requires_auth_and_returns_runtime_limits(client: TestClient) -> None:
+    assert client.get("/api/config").status_code == 401
+
+    response = client.get("/api/config", headers=auth_headers(client))
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "rag_top_k": {"default": 5, "min": 0, "max": 20},
+        "max_upload_bytes": 20 * 1024 * 1024,
+        "supported_file_extensions": ["txt", "pdf", "docx", "csv", "json"],
+    }
+
+
+def test_chat_returns_503_when_search_index_is_unavailable(client: TestClient) -> None:
+    app.state.db["document_chunks"].fail_aggregate = True
+
+    response = client.post(
+        "/api/chat",
+        headers=auth_headers(client),
+        json={"question": "What is the refund policy?", "top_k": 1},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "MongoDB search indexes are unavailable"
+
+def test_chat_returns_source_metadata(client: TestClient) -> None:
+    app.state.db["document_chunks"].aggregate_rows = [{
+        "_id": "chunk_1",
+        "document_id": "doc_1",
+        "document_name": "policy.pdf",
+        "content": "Refunds are available within 30 days.",
+        "score": 0.02,
+        "source_format": "pdf",
+        "chunk_type": "prose",
+        "location": {"page": 2},
+        "metadata": {"department": "support"},
+    }]
+
+    response = client.post(
+        "/api/chat",
+        headers=auth_headers(client),
+        json={"question": "What is the refund policy?", "top_k": 1},
+    )
+
+    assert response.status_code == 200
+    source = response.json()["sources"][0]
+    assert source["source_format"] == "pdf"
+    assert source["chunk_type"] == "prose"
+    assert source["location"] == {"page": 2}
+    assert source["metadata"] == {"department": "support"}

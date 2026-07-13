@@ -100,8 +100,11 @@ def build_prompt(
 
 
 def public_sources(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    keys = ("document_id", "document_name", "chunk_id", "snippet", "score")
-    return [{key: chunk[key] for key in keys} for chunk in chunks]
+    keys = (
+        "document_id", "document_name", "chunk_id", "snippet", "score",
+        "source_format", "chunk_type", "location", "metadata",
+    )
+    return [{key: chunk[key] for key in keys if key in chunk} for chunk in chunks]
 
 
 def sse(event: str, data: Any) -> str:

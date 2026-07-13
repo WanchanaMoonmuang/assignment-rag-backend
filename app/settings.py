@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     mongodb_conversation_collection: str = "conversations"
     mongodb_ingestion_job_collection: str = "ingestion_jobs"
     mongodb_vector_index: str | None = None
+    mongodb_search_index: str = "document_chunks_text_index"
     gemini_model: str = "gemini-3.5-flash"
     gemini_embedding_model: str = "gemini-embedding-2"
     gemini_embedding_dimensions: int = 768
@@ -28,7 +29,6 @@ class Settings(BaseSettings):
     jwt_secret_key: str = ""
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 60
-    rag_min_score: float = 0.0
     rag_top_k: int = Field(default=5, ge=0, le=20)
     history_context_window: int = Field(default=8, ge=0, le=100)
     gemini_temperature: float = Field(default=0.2, ge=0.0, le=2.0)
