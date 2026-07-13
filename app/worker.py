@@ -4,13 +4,15 @@ import asyncio
 import logging
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 from pymongo import ReturnDocument
 
-from app.rag import GeminiClient, chunk_text, make_id
+from app.extraction import ExtractedChunk, ExtractionError, extract, extract_text
+from app.rag import GeminiClient, make_id
 from app.settings import Settings, get_settings
-from app.storage import delete_object
+from app.storage import delete_object, download_object
 
 logger = logging.getLogger(__name__)
 
@@ -23,25 +25,88 @@ def job_filter(job: dict[str, Any]) -> dict[str, Any]:
     return {"_id": job["_id"], "status": "processing", "lease_token": job["lease_token"]}
 
 
-async def claim_job(db: Any, settings: Settings, worker_id: str) -> dict[str, Any] | None:
+def cleanup_job(job: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "_id": make_id("job"),
+        "document_id": job["document_id"],
+        "document_name": job["document_name"],
+        "source_kind": "cleanup",
+        "metadata": {},
+        "object_name": job["object_name"],
+        "status": "cleanup_pending",
+        "stage": "cleanup",
+        "cleanup_attempts": 0,
+        "created_at": now_utc(),
+        "updated_at": now_utc(),
+    }
+
+
+async def mark_job_failed(
+    db: Any,
+    settings: Settings,
+    job: dict[str, Any],
+    error: dict[str, str],
+    terminal: bool,
+    failure_filter: dict[str, Any],
+) -> bool:
     jobs = db[settings.mongodb_ingestion_job_collection]
-    now = now_utc()
-    await jobs.update_many(
+    update = {
+        "$set": {
+            "status": "failed" if terminal else "queued",
+            "stage": "failed",
+            "error": error,
+            "updated_at": now_utc(),
+        },
+        "$unset": {"lease_owner": "", "lease_token": "", "lease_expires_at": ""},
+    }
+    if not terminal or job.get("source_kind") != "file" or not job.get("object_name"):
+        return (await jobs.update_one(failure_filter, update)).modified_count == 1
+
+    session = await db.client.start_session()
+    async with session:
+        async with session.start_transaction():
+            result = await jobs.update_one(failure_filter, update, session=session)
+            if result.modified_count != 1:
+                return False
+            await jobs.insert_one(cleanup_job(job), session=session)
+    return True
+
+
+async def terminalize_expired_jobs(db: Any, settings: Settings, now: datetime) -> None:
+    jobs = db[settings.mongodb_ingestion_job_collection]
+    cursor = jobs.find(
         {
             "status": "processing",
             "lease_expires_at": {"$lt": now},
             "attempts": {"$gte": settings.ingestion_job_max_attempts},
-        },
-        {
-            "$set": {
-                "status": "failed",
-                "stage": "failed",
-                "error": {"code": "attempts_exhausted", "message": "Unable to process ingestion"},
-                "updated_at": now,
-            },
-            "$unset": {"lease_owner": "", "lease_token": "", "lease_expires_at": ""},
-        },
+        }
     )
+    for job in await cursor.to_list(length=50):
+        if (
+            job.get("status") != "processing"
+            or job.get("lease_expires_at") is None
+            or job["lease_expires_at"] >= now
+            or int(job.get("attempts") or 0) < settings.ingestion_job_max_attempts
+        ):
+            continue
+        await mark_job_failed(
+            db,
+            settings,
+            job,
+            {"code": "attempts_exhausted", "message": "Unable to process ingestion"},
+            True,
+            {
+                "_id": job["_id"],
+                "status": "processing",
+                "lease_expires_at": {"$lt": now},
+            },
+        )
+
+
+async def claim_job(db: Any, settings: Settings, worker_id: str) -> dict[str, Any] | None:
+    jobs = db[settings.mongodb_ingestion_job_collection]
+    now = now_utc()
+    await terminalize_expired_jobs(db, settings, now)
     return await jobs.find_one_and_update(
         {
             "$or": [
@@ -56,7 +121,7 @@ async def claim_job(db: Any, settings: Settings, worker_id: str) -> dict[str, An
         {
             "$set": {
                 "status": "processing",
-                "stage": "embedding",
+                "stage": "converting",
                 "lease_owner": worker_id,
                 "lease_token": make_id("lease"),
                 "lease_expires_at": now + timedelta(seconds=settings.ingestion_job_lease_seconds),
@@ -67,7 +132,6 @@ async def claim_job(db: Any, settings: Settings, worker_id: str) -> dict[str, An
         sort=[("created_at", 1)],
         return_document=ReturnDocument.AFTER,
     )
-
 
 async def renew_lease(db: Any, settings: Settings, job: dict[str, Any]) -> None:
     jobs = db[settings.mongodb_ingestion_job_collection]
@@ -87,39 +151,57 @@ async def renew_lease(db: Any, settings: Settings, job: dict[str, Any]) -> None:
             return
 
 
-async def process_text_job(db: Any, settings: Settings, gemini: GeminiClient, job: dict[str, Any]) -> None:
-    content = str(job["content"])
-    chunks = chunk_text(content, settings.rag_chunk_size, settings.rag_chunk_overlap)
-    embeddings = await gemini.embed_texts(chunks)
+async def set_stage(db: Any, settings: Settings, job: dict[str, Any], stage: str) -> None:
+    await db[settings.mongodb_ingestion_job_collection].update_one(
+        job_filter(job), {"$set": {"stage": stage, "updated_at": now_utc()}}
+    )
+
+
+async def publish_job(
+    db: Any,
+    settings: Settings,
+    gemini: GeminiClient,
+    job: dict[str, Any],
+    chunks: list[ExtractedChunk],
+    document: dict[str, Any],
+) -> None:
+    if not chunks:
+        raise ExtractionError("Document does not contain extractable text")
+    await set_stage(db, settings, job, "embedding")
+    embeddings = await gemini.embed_texts([chunk.content for chunk in chunks])
     if len(embeddings) != len(chunks):
         raise RuntimeError("Embedding count did not match chunk count")
 
     created_at = now_utc()
     document_id = job["document_id"]
     metadata = job.get("metadata") or {}
-    document = {
-        "_id": document_id,
-        "document_name": job["document_name"],
-        "source": "plain_text",
-        "chunks_count": len(chunks),
-        "metadata": metadata,
-        "created_at": created_at,
-        "updated_at": created_at,
-    }
+    document.update(
+        {
+            "_id": document_id,
+            "chunks_count": len(chunks),
+            "metadata": metadata,
+            "created_at": created_at,
+            "updated_at": created_at,
+        }
+    )
     chunk_documents = [
         {
             "_id": make_id("chunk"),
             "document_id": document_id,
             "document_name": job["document_name"],
             "chunk_index": index,
-            "content": chunk,
+            "content": chunk.content,
             "embedding": embedding,
             "metadata": metadata,
+            "source_format": document["source_format"],
+            "chunk_type": chunk.chunk_type,
+            "location": chunk.location,
             "created_at": created_at,
         }
         for index, (chunk, embedding) in enumerate(zip(chunks, embeddings), start=1)
     ]
 
+    await set_stage(db, settings, job, "finalizing")
     jobs = db[settings.mongodb_ingestion_job_collection]
     session = await db.client.start_session()
     async with session:
@@ -143,42 +225,86 @@ async def process_text_job(db: Any, settings: Settings, gemini: GeminiClient, jo
                 raise RuntimeError("Ingestion lease was lost")
 
 
+async def process_text_job(db: Any, settings: Settings, gemini: GeminiClient, job: dict[str, Any]) -> None:
+    content = str(job["content"])
+    await set_stage(db, settings, job, "chunking")
+    chunks = extract_text(
+        content.encode("utf-8"), settings.rag_chunk_size, settings.rag_chunk_overlap
+    )
+    await publish_job(
+        db,
+        settings,
+        gemini,
+        job,
+        chunks,
+        {
+            "document_name": job["document_name"],
+            "source": "plain_text",
+            "source_kind": "text",
+            "source_format": "txt",
+            "content_type": "text/plain; charset=utf-8",
+            "byte_size": len(content.encode("utf-8")),
+        },
+    )
+
+
+async def process_file_job(db: Any, settings: Settings, gemini: GeminiClient, job: dict[str, Any]) -> None:
+    await set_stage(db, settings, job, "converting")
+    try:
+        data = await download_object(settings, job["object_name"])
+    except Exception as exc:
+        raise ExtractionError("Original file could not be downloaded") from exc
+    await set_stage(db, settings, job, "extracting")
+    suffix = Path(job["document_name"]).suffix
+    chunks = extract(data, suffix, settings.rag_chunk_size, settings.rag_chunk_overlap)
+    await publish_job(
+        db,
+        settings,
+        gemini,
+        job,
+        chunks,
+        {
+            "document_name": job["document_name"],
+            "source": "file_upload",
+            "source_kind": "file",
+            "source_format": suffix.removeprefix(".").lower(),
+            "content_type": job["content_type"],
+            "byte_size": len(data),
+            "original_object_name": job["object_name"],
+        },
+    )
+
+
 async def process_job(db: Any, settings: Settings, gemini: GeminiClient, job: dict[str, Any]) -> None:
-    jobs = db[settings.mongodb_ingestion_job_collection]
     heartbeat = asyncio.create_task(renew_lease(db, settings, job))
     try:
         try:
-            if job["source_kind"] != "text":
-                raise RuntimeError("File extraction is not available yet")
+            process = process_text_job if job["source_kind"] == "text" else process_file_job
             await asyncio.wait_for(
-                process_text_job(db, settings, gemini, job),
+                process(db, settings, gemini, job),
                 timeout=settings.ingestion_processing_timeout_seconds,
             )
         except TimeoutError:
             error = {"code": "processing_timeout", "message": "Ingestion processing timed out"}
+        except ExtractionError as exc:
+            error = {"code": "extraction_failed", "message": str(exc)}
         except Exception:
             error = {"code": "ingestion_failed", "message": "Unable to process ingestion"}
         else:
             return
 
-        attempts = int(job.get("attempts") or 0)
-        await jobs.update_one(
+        await mark_job_failed(
+            db,
+            settings,
+            job,
+            error,
+            int(job.get("attempts") or 0) >= settings.ingestion_job_max_attempts,
             job_filter(job),
-            {
-                "$set": {
-                    "status": "failed" if attempts >= settings.ingestion_job_max_attempts else "queued",
-                    "stage": "failed",
-                    "error": error,
-                    "updated_at": now_utc(),
-                },
-                "$unset": {"lease_owner": "", "lease_token": "", "lease_expires_at": ""},
-            },
         )
     finally:
         heartbeat.cancel()
         with suppress(asyncio.CancelledError):
             await heartbeat
-
 
 async def sweep_cleanup(db: Any, settings: Settings) -> None:
     jobs = db[settings.mongodb_ingestion_job_collection]

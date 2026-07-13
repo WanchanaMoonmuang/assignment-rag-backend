@@ -6,9 +6,12 @@ dependencies = [
     "fastapi>=0.115.0",
     "google-cloud-storage>=3.12.1",
     "google-genai>=1.0.0",
+    "langchain-text-splitters>=1.1.2",
+    "markitdown>=0.1.6",
     "motor>=3.6.0",
     "pydantic-settings>=2.5.0",
     "pyjwt>=2.9.0",
+    "pymupdf>=1.28.0",
     "python-multipart>=0.0.32",
     "uvicorn[standard]>=0.30.0",
 ]
