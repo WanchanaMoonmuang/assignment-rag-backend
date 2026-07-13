@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 import io
 import json
+from urllib.parse import quote
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator
@@ -10,7 +11,7 @@ import zipfile
 
 from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pymongo.errors import OperationFailure
 
 from app.auth import create_access_token, credentials_match, get_current_username
@@ -26,7 +27,7 @@ from app.rag import (
 )
 from app.schemas import ChatRequest, IngestRequest, IngestionTextRequest, LoginRequest
 from app.settings import Settings, get_settings
-from app.storage import delete_object, upload_object
+from app.storage import delete_object, download_object, upload_object
 
 
 def now_utc() -> datetime:
@@ -269,21 +270,32 @@ async def retrieve_chunks(
     return chunks
 
 
+async def generate_answer(
+    gemini: GeminiClient,
+    prompt: str,
+) -> tuple[str, list[dict[str, Any]]]:
+    generate_with_calculator = getattr(gemini, "generate_with_calculator", None)
+    if generate_with_calculator is None:
+        return await gemini.generate(prompt), []
+    return await generate_with_calculator(prompt)
+
+
+
 async def completed_answer(
     payload: ChatRequest,
     db: Any,
     settings: Settings,
     gemini: GeminiClient,
     history_messages: list[dict[str, Any]],
-) -> tuple[str, list[dict[str, Any]]]:
+) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
     chunks = await retrieve_chunks(
         payload.question, clamp_top_k(payload.top_k, settings.rag_top_k), db, settings, gemini
     )
     prompt, prompt_chunks = build_prompt(
         chunks, payload.question, history_messages, settings.generation_context_token_budget
     )
-    answer = await gemini.generate(prompt)
-    return answer or FALLBACK_ANSWER, public_sources(prompt_chunks)
+    answer, tool_activity = await generate_answer(gemini, prompt)
+    return answer or FALLBACK_ANSWER, public_sources(prompt_chunks), tool_activity
 
 
 @router.get("/health")
@@ -508,6 +520,68 @@ async def list_documents(
     return {"documents": [serialize_document(document) for document in documents]}
 
 
+@router.get("/documents/{document_id}/chunks/{chunk_id}")
+async def get_cited_chunk(
+    document_id: str,
+    chunk_id: str,
+    _: str = Depends(get_current_username),
+    db: Any = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> dict[str, Any]:
+    chunk = await chunk_col(db, settings).find_one({"_id": chunk_id, "document_id": document_id})
+    if chunk is None:
+        raise HTTPException(status_code=404, detail="Chunk not found")
+    index = int(chunk.get("chunk_index") or 0)
+    rows = await chunk_col(db, settings).find(
+        {"document_id": document_id, "chunk_index": {"$gte": index - 2, "$lte": index + 2}}
+    ).sort("chunk_index", 1).to_list(length=5)
+    return {
+        "document_id": document_id,
+        "chunk": {
+            "chunk_id": chunk["_id"],
+            "content": chunk.get("content", ""),
+            "chunk_index": index,
+            "location": chunk.get("location"),
+            "metadata": chunk.get("metadata") or {},
+        },
+        "neighbors": [
+            {
+                "chunk_id": row["_id"],
+                "content": row.get("content", ""),
+                "chunk_index": row.get("chunk_index"),
+                "location": row.get("location"),
+            }
+            for row in rows
+        ],
+    }
+
+
+@router.get("/documents/{document_id}/file")
+async def get_original_file(
+    document_id: str,
+    _: str = Depends(get_current_username),
+    db: Any = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> Response:
+    document = await doc_col(db, settings).find_one({"_id": document_id})
+    if document is None or not document.get("original_object_name"):
+        raise HTTPException(status_code=404, detail="Original file not found")
+    try:
+        content = await download_object(settings, document["original_object_name"])
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail="Original file not found") from exc
+    filename = quote(document["document_name"], safe="")
+    return Response(
+        content=content,
+        media_type=document.get("content_type") or "application/octet-stream",
+        headers={"Content-Disposition": "attachment; filename*=UTF-8''" + filename},
+    )
+
+
+
+
+
+
 async def schedule_cleanup(
     db: Any, settings: Settings, document_id: str, document_name: str, object_name: str
 ) -> None:
@@ -620,15 +694,15 @@ async def chat(
     settings: Settings = Depends(get_settings),
 ) -> dict[str, Any]:
     conversation, history_messages = await prepare_chat(payload, db, settings)
-    answer, sources = await completed_answer(payload, db, settings, gemini, history_messages)
+    answer, sources, tool_activity = await completed_answer(payload, db, settings, gemini, history_messages)
     await append_message(
         db,
         settings,
         conversation["_id"],
-        {"role": "assistant", "content": answer, "sources": sources, "created_at": now_utc()},
+        {"role": "assistant", "content": answer, "sources": sources, "tool_activity": tool_activity, "created_at": now_utc()},
         answer,
     )
-    return {"conversation_id": conversation["_id"], "answer": answer, "sources": sources}
+    return {"conversation_id": conversation["_id"], "answer": answer, "sources": sources, "tool_activity": tool_activity}
 
 
 @router.post("/chat/stream")
@@ -640,23 +714,37 @@ async def stream_chat(
     settings: Settings = Depends(get_settings),
 ) -> StreamingResponse:
     conversation, history_messages = await prepare_chat(payload, db, settings)
+    request_id = make_id("req")
+    effective_top_k = clamp_top_k(payload.top_k, settings.rag_top_k)
 
     async def events() -> AsyncIterator[str]:
         yield sse(
             "conversation",
             {"conversation_id": conversation["_id"], "title": conversation["title"]},
         )
+        yield sse("metadata", {"request_id": request_id, "top_k": effective_top_k})
         try:
             chunks = await retrieve_chunks(
-                payload.question, clamp_top_k(payload.top_k, settings.rag_top_k), db, settings, gemini
+                payload.question, effective_top_k, db, settings, gemini
             )
             prompt, prompt_chunks = build_prompt(
                 chunks, payload.question, history_messages, settings.generation_context_token_budget
             )
+            tool_activity: list[dict[str, Any]] = []
             answer_parts: list[str] = []
-            async for token in gemini.stream(prompt):
-                answer_parts.append(token)
-                yield sse("token", {"text": token})
+            stream_with_calculator = getattr(gemini, "stream_with_calculator", None)
+            if stream_with_calculator is None:
+                async for token in gemini.stream(prompt):
+                    answer_parts.append(token)
+                    yield sse("token", {"text": token})
+            else:
+                async for event, data in stream_with_calculator(prompt):
+                    if event == "token":
+                        answer_parts.append(data)
+                        yield sse("token", {"text": data})
+                    else:
+                        tool_activity.append(data)
+                        yield sse(event, data)
             answer = "".join(answer_parts).strip() or FALLBACK_ANSWER
             sources = public_sources(prompt_chunks)
             yield sse("sources", sources)
@@ -664,7 +752,7 @@ async def stream_chat(
                 db,
                 settings,
                 conversation["_id"],
-                {"role": "assistant", "content": answer, "sources": sources, "created_at": now_utc()},
+                {"role": "assistant", "content": answer, "sources": sources, "tool_activity": tool_activity, "created_at": now_utc()},
                 answer,
             )
             yield sse("done", {"status": "completed"})

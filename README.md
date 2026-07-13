@@ -72,6 +72,8 @@ Vector Search and Atlas Search indexes exist on the chunks collection.
 - `POST /api/ingestions/file`
 - `GET /api/ingestions/{job_id}`
 - `GET /api/documents`
+- `GET /api/documents/{document_id}/chunks/{chunk_id}`
+- `GET /api/documents/{document_id}/file`
 - `DELETE /api/documents/{document_id}`
 - `GET /api/conversations`
 - `GET /api/conversations/{conversation_id}`
