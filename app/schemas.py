@@ -13,7 +13,7 @@ class IngestRequest(BaseModel):
     content: str = Field(min_length=1)
     metadata: dict[str, Any] | None = None
 
-    @field_validator("document_name", "content")
+    @field_validator("document_name")
     @classmethod
     def strip_non_empty(cls, value: str) -> str:
         value = value.strip()
@@ -30,6 +30,20 @@ class ChatRequest(BaseModel):
     @field_validator("question")
     @classmethod
     def strip_question(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be empty")
+        return value
+
+
+class IngestionTextRequest(BaseModel):
+    document_name: str = Field(min_length=1)
+    content: str = Field(min_length=1)
+    metadata: dict[str, Any] | None = None
+
+    @field_validator("document_name")
+    @classmethod
+    def strip_non_empty(cls, value: str) -> str:
         value = value.strip()
         if not value:
             raise ValueError("must not be empty")

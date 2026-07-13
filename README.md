@@ -8,6 +8,7 @@ FastAPI backend for the RAG chatbot demo. API docs run at `/api/docs`.
 uv sync --extra dev
 cp .env.example .env
 uv run uvicorn app.main:app --reload
+uv run python -m app.worker
 ```
 
 Required real-service values in `.env`:
@@ -20,6 +21,7 @@ For the PRD default demo account, set `AUTH_USERNAME=admin` and `AUTH_PASSWORD=a
 - `MONGODB_URI`
 - `MONGODB_DATABASE`
 - `MONGODB_VECTOR_INDEX`
+- `GCS_BUCKET_NAME` for private original files used by V2 file ingestion
 - `JWT_SECRET_KEY`
 - `AUTH_PASSWORD`
 
@@ -30,9 +32,10 @@ Optional tuning values:
 - `RAG_TOP_K` default `5`
 - `HISTORY_CONTEXT_WINDOW` default `8`
 - `GEMINI_TEMPERATURE` default `0.2`
-- `GENERATION_CONTEXT_TOKEN_BUDGET` default `32000` (estimated tokens; retrieved chunks are removed before oldest history)
+- `GENERATION_CONTEXT_TOKEN_BUDGET` default `32000` (a conservative UTF-8 byte upper bound; retrieved chunks are removed before oldest history)
 - `RAG_CHUNK_SIZE` default `900`
 - `RAG_CHUNK_OVERLAP` default `150`
+- `INGESTION_JOB_LEASE_SECONDS` default `300`, `INGESTION_JOB_MAX_ATTEMPTS` default `3`, and `INGESTION_PROCESSING_TIMEOUT_SECONDS` default `600`
 
 ## Checks
 
@@ -50,7 +53,10 @@ Vector Search index exists on the chunks collection.
 - `GET /api/health`
 - `POST /api/auth/login`
 - `GET /api/auth/me`
-- `POST /api/ingest`
+- `POST /api/ingest` (deprecated; enqueues the same V2 text-ingestion job)
+- `POST /api/ingestions/text`
+- `POST /api/ingestions/file`
+- `GET /api/ingestions/{job_id}`
 - `GET /api/documents`
 - `DELETE /api/documents/{document_id}`
 - `GET /api/conversations`

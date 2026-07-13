@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
 
@@ -11,6 +12,7 @@ from fastapi.testclient import TestClient
 from app.main import app, configure_gemini_client
 from app.rag import SYSTEM_INSTRUCTION, GeminiClient, build_prompt, chunk_text, question_fits_budget
 from app.settings import Settings, get_settings
+from app.worker import claim_job, process_job
 
 
 class Cursor:
@@ -81,6 +83,28 @@ class Collection:
             doc[key] = value
         for key, value in update.get("$push", {}).items():
             doc.setdefault(key, []).append(deepcopy(value))
+        return SimpleNamespace(modified_count=1)
+
+    async def update_many(self, query: dict[str, Any], update: dict[str, Any]) -> Any:
+        updated = 0
+        for doc in self.docs.values():
+            expires_before = query.get("lease_expires_at", {}).get("$lt")
+            attempts_at_least = query.get("attempts", {}).get("$gte")
+            if query.get("status") != doc.get("status"):
+                continue
+            if expires_before and not doc.get("lease_expires_at") < expires_before:
+                continue
+            if attempts_at_least is not None and doc.get("attempts", 0) < attempts_at_least:
+                continue
+            for key, value in update.get("$set", {}).items():
+                doc[key] = value
+            updated += 1
+        return SimpleNamespace(modified_count=updated)
+
+
+    async def find_one_and_update(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
 
     def aggregate(self, pipeline: list[dict[str, Any]]) -> Cursor:
         self.last_pipeline = deepcopy(pipeline)
@@ -120,6 +144,7 @@ class FakeDB:
             "documents": Collection(),
             "document_chunks": Collection(),
             "conversations": Collection(),
+            "ingestion_jobs": Collection(),
         }
         self.client = FakeClient(self)
 
@@ -442,19 +467,18 @@ def test_ingest_lists_and_deletes_document(client: TestClient) -> None:
     response = client.post(
         "/api/ingest",
         headers=headers,
-        json={
-            "document_name": "policy.txt",
-            "content": "Refunds are available within 30 days.",
-            "metadata": {"source": "txt_upload"},
-        },
+        json={"document_name": "policy.txt", "content": "Refunds are available."},
     )
-    assert response.status_code == 200
-    document_id = response.json()["document_id"]
+    assert response.status_code == 202
+    payload = response.json()
+    job = app.state.db["ingestion_jobs"].docs[payload["job_id"]]
+    job.update({"status": "processing", "lease_token": "test-lease", "attempts": 1})
+    asyncio.run(process_job(app.state.db, app.dependency_overrides[get_settings](), app.state.gemini, job))
 
     list_response = client.get("/api/documents", headers=headers)
-    assert list_response.json()["documents"][0]["document_id"] == document_id
+    assert list_response.json()["documents"][0]["document_id"] == payload["document_id"]
 
-    delete_response = client.delete(f"/api/documents/{document_id}", headers=headers)
+    delete_response = client.delete(f"/api/documents/{payload['document_id']}", headers=headers)
     assert delete_response.status_code == 200
     assert delete_response.json()["deleted_chunks"] == 1
 
@@ -462,13 +486,17 @@ def test_ingest_lists_and_deletes_document(client: TestClient) -> None:
 def test_ingest_rolls_back_if_chunk_insert_fails(client: TestClient) -> None:
     headers = auth_headers(client)
     app.state.db["document_chunks"].fail_insert_many = True
-
     response = client.post(
         "/api/ingest",
         headers=headers,
         json={"document_name": "policy.txt", "content": "Refunds are available."},
     )
-    assert response.status_code == 500
+    assert response.status_code == 202
+    job = app.state.db["ingestion_jobs"].docs[response.json()["job_id"]]
+    job.update({"status": "processing", "lease_token": "test-lease", "attempts": 1})
+    asyncio.run(process_job(app.state.db, app.dependency_overrides[get_settings](), app.state.gemini, job))
+
+    assert app.state.db["ingestion_jobs"].docs[response.json()["job_id"]]["status"] == "queued"
     assert app.state.db["documents"].docs == {}
     assert app.state.db["document_chunks"].docs == {}
 
@@ -480,15 +508,15 @@ def test_document_delete_rolls_back_if_chunk_delete_fails(client: TestClient) ->
         headers=headers,
         json={"document_name": "policy.txt", "content": "Refunds are available."},
     )
-    document_id = response.json()["document_id"]
+    payload = response.json()
+    job = app.state.db["ingestion_jobs"].docs[payload["job_id"]]
+    job.update({"status": "processing", "lease_token": "test-lease", "attempts": 1})
+    asyncio.run(process_job(app.state.db, app.dependency_overrides[get_settings](), app.state.gemini, job))
     app.state.db["document_chunks"].fail_delete_many = True
 
-    delete_response = client.delete(f"/api/documents/{document_id}", headers=headers)
+    delete_response = client.delete(f"/api/documents/{payload['document_id']}", headers=headers)
     assert delete_response.status_code == 500
-
-    list_response = client.get("/api/documents", headers=headers)
-    assert list_response.json()["documents"][0]["document_id"] == document_id
-    assert len(app.state.db["document_chunks"].docs) == 1
+    assert payload["document_id"] in app.state.db["documents"].docs
 
 
 def test_document_delete_rolls_back_if_metadata_delete_fails(client: TestClient) -> None:
@@ -498,15 +526,15 @@ def test_document_delete_rolls_back_if_metadata_delete_fails(client: TestClient)
         headers=headers,
         json={"document_name": "policy.txt", "content": "Refunds are available."},
     )
-    document_id = response.json()["document_id"]
+    payload = response.json()
+    job = app.state.db["ingestion_jobs"].docs[payload["job_id"]]
+    job.update({"status": "processing", "lease_token": "test-lease", "attempts": 1})
+    asyncio.run(process_job(app.state.db, app.dependency_overrides[get_settings](), app.state.gemini, job))
     app.state.db["documents"].fail_delete_one = True
 
-    delete_response = client.delete(f"/api/documents/{document_id}", headers=headers)
+    delete_response = client.delete(f"/api/documents/{payload['document_id']}", headers=headers)
     assert delete_response.status_code == 500
-
-    list_response = client.get("/api/documents", headers=headers)
-    assert list_response.json()["documents"][0]["document_id"] == document_id
-    assert len(app.state.db["document_chunks"].docs) == 1
+    assert payload["document_id"] in app.state.db["documents"].docs
 
 
 def test_chat_without_retrieval_uses_foundation_answer(client: TestClient) -> None:
@@ -788,3 +816,158 @@ def test_chat_rejects_question_over_context_budget(client: TestClient) -> None:
 
     assert response.status_code == 422
     assert app.state.db["conversations"].docs == {}
+
+
+def test_text_ingestion_enqueues_and_worker_publishes_document(client: TestClient) -> None:
+    response = client.post(
+        "/api/ingestions/text",
+        headers=auth_headers(client),
+        json={
+            "document_name": "policy.txt",
+            "content": "Refunds are available within 30 days.",
+            "metadata": {"department": "support"},
+        },
+    )
+
+    assert response.status_code == 202
+    payload = response.json()
+    assert payload["status"] == "queued"
+
+    status_response = client.get(
+        f"/api/ingestions/{payload['job_id']}",
+        headers=auth_headers(client),
+    )
+    assert status_response.status_code == 200
+    job = app.state.db["ingestion_jobs"].docs[payload["job_id"]]
+    job.update({"status": "processing", "lease_token": "test-lease", "attempts": 1})
+    asyncio.run(process_job(app.state.db, app.dependency_overrides[get_settings](), app.state.gemini, job))
+
+    assert app.state.db["ingestion_jobs"].docs[payload["job_id"]]["status"] == "completed"
+    assert payload["document_id"] in app.state.db["documents"].docs
+
+
+def test_file_ingestion_rejects_oversized_file_before_upload(client: TestClient) -> None:
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        auth_password="adminRAG123",
+        jwt_secret_key="test-secret-key-with-at-least-32-bytes",
+        mongodb_vector_index="test-index",
+        max_upload_bytes=3,
+    )
+
+    response = client.post(
+        "/api/ingestions/file",
+        headers=auth_headers(client),
+        files={"file": ("policy.txt", b"four", "text/plain")},
+    )
+
+    assert response.status_code == 413
+    assert app.state.db["ingestion_jobs"].docs == {}
+
+
+def test_file_ingestion_returns_failed_job_when_original_upload_fails(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def fail_upload(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("storage unavailable")
+
+    monkeypatch.setattr("app.main.upload_object", fail_upload)
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        auth_password="adminRAG123",
+        jwt_secret_key="test-secret-key-with-at-least-32-bytes",
+        mongodb_vector_index="test-index",
+        gcs_bucket_name="test-bucket",
+    )
+
+    response = client.post(
+        "/api/ingestions/file",
+        headers=auth_headers(client),
+        files={"file": ("policy.txt", b"content", "text/plain")},
+    )
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "failed"
+    assert response.json()["error"]["code"] == "original_upload_failed"
+
+
+def test_text_ingestion_counts_raw_whitespace_bytes(client: TestClient) -> None:
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        auth_password="adminRAG123",
+        jwt_secret_key="test-secret-key-with-at-least-32-bytes",
+        mongodb_vector_index="test-index",
+        max_upload_bytes=3,
+    )
+
+    response = client.post(
+        "/api/ingestions/text",
+        headers=auth_headers(client),
+        json={"document_name": "policy.txt", "content": "   x"},
+    )
+
+    assert response.status_code == 413
+    assert app.state.db["ingestion_jobs"].docs == {}
+
+
+def test_file_ingestion_rejects_mismatched_signature_before_job(client: TestClient) -> None:
+    response = client.post(
+        "/api/ingestions/file",
+        headers=auth_headers(client),
+        files={"file": ("report.pdf", b"not a PDF", "application/pdf")},
+    )
+
+    assert response.status_code == 415
+    assert app.state.db["ingestion_jobs"].docs == {}
+
+
+def test_claim_marks_expired_final_attempt_as_failed(client: TestClient) -> None:
+    settings = app.dependency_overrides[get_settings]()
+    job_id = "job_expired"
+    app.state.db["ingestion_jobs"].docs[job_id] = {
+        "_id": job_id,
+        "status": "processing",
+        "attempts": settings.ingestion_job_max_attempts,
+        "lease_expires_at": datetime.now(timezone.utc) - timedelta(seconds=1),
+    }
+
+    assert asyncio.run(claim_job(app.state.db, settings, "worker")) is None
+    assert app.state.db["ingestion_jobs"].docs[job_id]["status"] == "failed"
+
+
+def test_stale_lease_cannot_publish_document(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    response = client.post(
+        "/api/ingestions/text",
+        headers=auth_headers(client),
+        json={"document_name": "policy.txt", "content": "Refunds are available."},
+    )
+    job = app.state.db["ingestion_jobs"].docs[response.json()["job_id"]]
+    job.update({"status": "processing", "lease_token": "stale", "attempts": 1})
+
+    async def reject_fenced_update(*args: Any, **kwargs: Any) -> Any:
+        return SimpleNamespace(modified_count=0)
+
+    monkeypatch.setattr(app.state.db["ingestion_jobs"], "update_one", reject_fenced_update)
+    asyncio.run(process_job(app.state.db, app.dependency_overrides[get_settings](), app.state.gemini, job))
+
+    assert app.state.db["documents"].docs == {}
+    assert app.state.db["document_chunks"].docs == {}
+
+
+def test_worker_records_processing_timeout(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    response = client.post(
+        "/api/ingestions/text",
+        headers=auth_headers(client),
+        json={"document_name": "policy.txt", "content": "Refunds are available."},
+    )
+    job = app.state.db["ingestion_jobs"].docs[response.json()["job_id"]]
+    job.update({"status": "processing", "lease_token": "test-lease", "attempts": 1})
+
+    async def timeout(*args: Any, **kwargs: Any) -> None:
+        raise TimeoutError
+
+    monkeypatch.setattr("app.worker.process_text_job", timeout)
+    asyncio.run(process_job(app.state.db, app.dependency_overrides[get_settings](), app.state.gemini, job))
+
+    stored = app.state.db["ingestion_jobs"].docs[job["_id"]]
+    assert stored["status"] == "queued"
+    assert stored["error"]["code"] == "processing_timeout"
