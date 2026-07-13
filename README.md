@@ -21,6 +21,7 @@ For the PRD default demo account, set `AUTH_USERNAME=admin` and `AUTH_PASSWORD=a
 - `MONGODB_URI`
 - `MONGODB_DATABASE`
 - `MONGODB_VECTOR_INDEX`
+- `MONGODB_SEARCH_INDEX` (defaults to `document_chunks_text_index`)
 - `GCS_BUCKET_NAME` for private original files used by V2 file ingestion
 - `JWT_SECRET_KEY`
 - `AUTH_PASSWORD`
@@ -58,11 +59,12 @@ uv run python -m app.check_config
 ```
 
 `python -m app.check_config` pings MongoDB and checks that the configured Atlas
-Vector Search index exists on the chunks collection.
+Vector Search and Atlas Search indexes exist on the chunks collection.
 
 ## API
 
 - `GET /api/health`
+- `GET /api/config`
 - `POST /api/auth/login`
 - `GET /api/auth/me`
 - `POST /api/ingest` (deprecated; enqueues the same V2 text-ingestion job)
@@ -83,8 +85,14 @@ Protected endpoints require:
 Authorization: Bearer <access_token>
 ```
 
-## MongoDB Vector Search
+## MongoDB Search Indexes
+
+MongoDB Atlas 8.0 or later is required for hybrid retrieval.
 
 Create an Atlas Vector Search index on `MONGODB_CHUNK_COLLECTION` using
 `docs/mongodb-vector-index.json`. The vector dimensions must match
 `GEMINI_EMBEDDING_DIMENSIONS` (`768` by default).
+
+Create an Atlas Search index named by `MONGODB_SEARCH_INDEX` using
+`docs/mongodb-search-index.json`. Retrieval combines equal-weight lexical and
+vector result sets with MongoDB `$rankFusion`, then applies the requested Top K.

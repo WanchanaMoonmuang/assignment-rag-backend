@@ -11,6 +11,7 @@ import zipfile
 from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from pymongo.errors import OperationFailure
 
 from app.auth import create_access_token, credentials_match, get_current_username
 from app.rag import (
@@ -69,6 +70,8 @@ app.add_middleware(
 
 
 router = APIRouter(prefix="/api")
+SUPPORTED_FILE_EXTENSIONS = ("txt", "pdf", "docx", "csv", "json")
+
 
 def get_db(request: Request) -> Any:
     db = getattr(request.app.state, "db", None)
@@ -204,32 +207,50 @@ async def retrieve_chunks(
     if not settings.mongodb_vector_index:
         raise HTTPException(status_code=500, detail="MONGODB_VECTOR_INDEX is not configured")
     [query_embedding] = await gemini.embed_texts([question])
+    candidate_limit = max(top_k * 4, 20)
     pipeline = [
         {
-            "$vectorSearch": {
-                "index": settings.mongodb_vector_index,
-                "path": "embedding",
-                "queryVector": query_embedding,
-                "numCandidates": max(top_k * 20, 100),
-                "limit": top_k,
+            "$rankFusion": {
+                "input": {"pipelines": {
+                    "vector": [{"$vectorSearch": {
+                        "index": settings.mongodb_vector_index,
+                        "path": "embedding",
+                        "queryVector": query_embedding,
+                        "numCandidates": max(candidate_limit * 20, 100),
+                        "limit": candidate_limit,
+                    }}],
+                    "lexical": [
+                        {"$search": {"index": settings.mongodb_search_index,
+                          "text": {"query": question, "path": "content"}}},
+                        {"$limit": candidate_limit},
+                    ],
+                }},
+                "combination": {"weights": {"vector": 1, "lexical": 1}},
+                "scoreDetails": True,
             }
         },
+        {"$limit": top_k},
         {
             "$project": {
                 "_id": 1,
                 "document_id": 1,
                 "document_name": 1,
                 "content": 1,
-                "score": {"$meta": "vectorSearchScore"},
+                "source_format": 1,
+                "chunk_type": 1,
+                "location": 1,
+                "metadata": 1,
+                "score": {"$meta": "score"},
             }
         },
     ]
-    rows = await chunk_col(db, settings).aggregate(pipeline).to_list(length=top_k)
+    try:
+        rows = await chunk_col(db, settings).aggregate(pipeline).to_list(length=top_k)
+    except OperationFailure as exc:
+        raise HTTPException(status_code=503, detail="MongoDB search indexes are unavailable") from exc
     chunks = []
     for row in rows:
         score = float(row.get("score") or 0)
-        if score < settings.rag_min_score:
-            continue
         content = row.get("content", "")
         chunks.append(
             {
@@ -239,6 +260,10 @@ async def retrieve_chunks(
                 "content": content,
                 "snippet": content[:500],
                 "score": score,
+                "source_format": row.get("source_format"),
+                "chunk_type": row.get("chunk_type"),
+                "location": row.get("location"),
+                "metadata": row.get("metadata"),
             }
         )
     return chunks
@@ -264,6 +289,18 @@ async def completed_answer(
 @router.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@router.get("/config")
+async def config(
+    username: str = Depends(get_current_username),
+    settings: Settings = Depends(get_settings),
+) -> dict[str, Any]:
+    return {
+        "rag_top_k": {"default": settings.rag_top_k, "min": 0, "max": 20},
+        "max_upload_bytes": settings.max_upload_bytes,
+        "supported_file_extensions": list(SUPPORTED_FILE_EXTENSIONS),
+    }
 
 
 @router.post("/auth/login")
