@@ -342,7 +342,7 @@ def test_gemini_client_requires_provider_configuration(monkeypatch: pytest.Monke
     install_fake_genai(monkeypatch, Client)
 
     with pytest.raises(RuntimeError, match="GEMINI_API_KEY"):
-        GeminiClient(Settings(gemini_api_key=None, _env_file=None))
+        GeminiClient(Settings(gemini_provider="developer_api", gemini_api_key=None, _env_file=None))
 
     with pytest.raises(RuntimeError, match="GOOGLE_CLOUD_PROJECT"):
         GeminiClient(
@@ -395,6 +395,7 @@ def test_vertex_ai_accepts_gcp_project_id_fallback(monkeypatch: pytest.MonkeyPat
             gemini_provider="vertex_ai",
             google_cloud_project=None,
             gcp_project_id="fallback-project",
+            google_cloud_location="us-central1",
             _env_file=None,
         )
     )
@@ -971,3 +972,94 @@ def test_worker_records_processing_timeout(client: TestClient, monkeypatch: pyte
     stored = app.state.db["ingestion_jobs"].docs[job["_id"]]
     assert stored["status"] == "queued"
     assert stored["error"]["code"] == "processing_timeout"
+
+
+
+def test_file_worker_downloads_extracts_and_publishes_metadata(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def upload(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    async def download(*args: Any, **kwargs: Any) -> bytes:
+        return b"First line.\nSecond line."
+
+    monkeypatch.setattr("app.main.upload_object", upload)
+    monkeypatch.setattr("app.worker.download_object", download)
+    response = client.post(
+        "/api/ingestions/file",
+        headers=auth_headers(client),
+        files={"file": ("policy.txt", b"First line.\nSecond line.", "text/plain")},
+        data={"metadata_json": '{"department":"support"}'},
+    )
+
+    assert response.status_code == 202
+    payload = response.json()
+    job = app.state.db["ingestion_jobs"].docs[payload["job_id"]]
+    job.update({"status": "processing", "lease_token": "test-lease", "attempts": 1})
+    asyncio.run(process_job(app.state.db, app.dependency_overrides[get_settings](), app.state.gemini, job))
+
+    document = app.state.db["documents"].docs[payload["document_id"]]
+    chunk = next(iter(app.state.db["document_chunks"].docs.values()))
+    assert document["source_format"] == "txt"
+    assert document["original_object_name"] == job["object_name"]
+    assert document["metadata"] == {"department": "support"}
+    assert chunk["location"]["label"] == "Lines 1-2"
+    assert chunk["chunk_type"] == "prose"
+
+
+
+def test_expired_final_file_job_schedules_cleanup(client: TestClient) -> None:
+    settings = app.dependency_overrides[get_settings]()
+    app.state.db["ingestion_jobs"].docs["job_expired_file"] = {
+        "_id": "job_expired_file",
+        "document_id": "doc_expired_file",
+        "document_name": "policy.txt",
+        "source_kind": "file",
+        "object_name": "originals/doc_expired_file/policy.txt",
+        "status": "processing",
+        "attempts": settings.ingestion_job_max_attempts,
+        "lease_expires_at": datetime.now(timezone.utc) - timedelta(seconds=1),
+    }
+
+    assert asyncio.run(claim_job(app.state.db, settings, "worker")) is None
+    cleanup_jobs = [
+        job
+        for job in app.state.db["ingestion_jobs"].docs.values()
+        if job["status"] == "cleanup_pending"
+    ]
+    assert len(cleanup_jobs) == 1
+    assert cleanup_jobs[0]["object_name"] == "originals/doc_expired_file/policy.txt"
+
+
+def test_terminal_file_failure_records_cleanup_atomically(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def upload(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    async def download(*args: Any, **kwargs: Any) -> bytes:
+        raise RuntimeError("storage unavailable")
+
+    monkeypatch.setattr("app.main.upload_object", upload)
+    monkeypatch.setattr("app.worker.download_object", download)
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        auth_password="adminRAG123",
+        jwt_secret_key="test-secret-key-with-at-least-32-bytes",
+        mongodb_vector_index="test-index",
+        ingestion_job_max_attempts=1,
+    )
+    response = client.post(
+        "/api/ingestions/file",
+        headers=auth_headers(client),
+        files={"file": ("policy.txt", b"content", "text/plain")},
+    )
+    job = app.state.db["ingestion_jobs"].docs[response.json()["job_id"]]
+    job.update({"status": "processing", "lease_token": "test-lease", "attempts": 1})
+    asyncio.run(process_job(app.state.db, app.dependency_overrides[get_settings](), app.state.gemini, job))
+
+    assert job["status"] == "failed"
+    assert any(
+        item["status"] == "cleanup_pending"
+        for item in app.state.db["ingestion_jobs"].docs.values()
+    )

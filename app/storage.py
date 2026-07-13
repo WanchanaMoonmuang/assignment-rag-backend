@@ -19,6 +19,19 @@ async def upload_object(settings: Settings, object_name: str, data: bytes, conte
     await asyncio.to_thread(upload)
 
 
+async def download_object(settings: Settings, object_name: str) -> bytes:
+    if not settings.gcs_bucket_name:
+        raise RuntimeError("GCS_BUCKET_NAME is not configured")
+
+    from google.cloud import storage
+
+    def download() -> bytes:
+        client = storage.Client(project=settings.gcs_project_id or None)
+        return client.bucket(settings.gcs_bucket_name).blob(object_name).download_as_bytes()
+
+    return await asyncio.to_thread(download)
+
+
 async def delete_object(settings: Settings, object_name: str) -> None:
     if not settings.gcs_bucket_name:
         raise RuntimeError("GCS_BUCKET_NAME is not configured")
