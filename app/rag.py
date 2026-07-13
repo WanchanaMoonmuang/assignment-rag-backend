@@ -4,6 +4,7 @@ import asyncio
 import json
 from typing import Any, AsyncIterator
 from uuid import uuid4
+from app.calculator import CalculatorError, calculate
 
 from app.settings import Settings
 
@@ -170,56 +171,128 @@ class GeminiClient:
         )
 
     async def generate(self, prompt: str) -> str:
-        if self._provider == "vertex_ai":
-            response = await asyncio.to_thread(
-                self._client.models.generate_content,
-                model=self._settings.gemini_model,
-                contents=prompt,
-                config=self._generate_content_config(),
-            )
-            return (getattr(response, "text", "") or "").strip()
-
-        interaction = await asyncio.to_thread(
-            self._client.interactions.create,
+        response = await asyncio.to_thread(
+            self._client.models.generate_content,
             model=self._settings.gemini_model,
-            input=prompt,
-            system_instruction=SYSTEM_INSTRUCTION,
-            generation_config={"temperature": self._settings.gemini_temperature},
-            store=False,
+            contents=prompt,
+            config=self._generate_content_config(),
         )
-        return (getattr(interaction, "output_text", "") or "").strip()
+        return (getattr(response, "text", "") or "").strip()
 
-    async def stream(self, prompt: str) -> AsyncIterator[str]:
-        if self._provider == "vertex_ai":
-            stream = await asyncio.to_thread(
-                self._client.models.generate_content_stream,
-                model=self._settings.gemini_model,
-                contents=prompt,
-                config=self._generate_content_config(),
-            )
-            while True:
-                chunk = await asyncio.to_thread(_next_or_none, iter(stream))
-                if chunk is None:
-                    break
-                if getattr(chunk, "text", None):
-                    yield chunk.text
-            return
 
-        stream = await asyncio.to_thread(
-            self._client.interactions.create,
+    async def generate_with_calculator(self, prompt: str) -> tuple[str, list[dict[str, Any]]]:
+        activity: list[dict[str, Any]] = []
+
+        def calculator(expression: str) -> dict[str, Any]:
+            try:
+                result = calculate(expression)
+                record = {"name": "calculator", "arguments": {"expression": expression}, "result": result}
+            except CalculatorError as exc:
+                record = {"name": "calculator", "arguments": {"expression": expression}, "error": str(exc)}
+            activity.append(record)
+            return record
+
+        response = await asyncio.to_thread(
+            self._client.models.generate_content,
             model=self._settings.gemini_model,
-            input=prompt,
+            contents=prompt,
+            config=self._types.GenerateContentConfig(
+                system_instruction=SYSTEM_INSTRUCTION,
+                temperature=self._settings.gemini_temperature,
+                tools=[calculator],
+            ),
+        )
+        return (getattr(response, "text", "") or "").strip(), activity
+
+
+    async def stream_with_calculator(self, prompt: str) -> AsyncIterator[tuple[str, Any]]:
+        declaration = self._types.FunctionDeclaration(
+            name="calculator",
+            description="Evaluate a mathematical expression.",
+            parametersJsonSchema={
+                "type": "object",
+                "properties": {"expression": {"type": "string"}},
+                "required": ["expression"],
+            },
+        )
+        config = self._types.GenerateContentConfig(
             system_instruction=SYSTEM_INSTRUCTION,
-            generation_config={"temperature": self._settings.gemini_temperature},
-            stream=True,
-            store=False,
+            temperature=self._settings.gemini_temperature,
+            tools=[self._types.Tool(functionDeclarations=[declaration])],
+        )
+        stream = await asyncio.to_thread(
+            self._client.models.generate_content_stream,
+            model=self._settings.gemini_model,
+            contents=prompt,
+            config=config,
+        )
+        function_calls: list[Any] = []
+        while True:
+            chunk = await asyncio.to_thread(_next_or_none, iter(stream))
+            if chunk is None:
+                break
+            if getattr(chunk, "text", None):
+                yield "token", chunk.text
+            function_calls.extend(getattr(chunk, "function_calls", None) or [])
+        if not function_calls:
+            return
+        response_parts = []
+        call_parts = []
+        for function_call in function_calls:
+            arguments = dict(function_call.args or {})
+            yield "tool_call", {"name": function_call.name, "status": "requested"}
+            try:
+                result = calculate(str(arguments.get("expression", "")))
+                response_data = {"result": result}
+                yield "tool_result", {
+                    "name": function_call.name,
+                    "status": "completed",
+                    "display_value": str(result),
+                }
+            except CalculatorError as exc:
+                response_data = {"error": str(exc)}
+                yield "tool_result", {
+                    "name": function_call.name,
+                    "status": "failed",
+                    "display_value": "Calculation failed",
+                }
+            call_parts.append(self._types.Part(functionCall=function_call))
+            response_parts.append(
+                self._types.Part.from_function_response(
+                    name=function_call.name,
+                    response=response_data,
+                )
+            )
+        follow_up = await asyncio.to_thread(
+            self._client.models.generate_content_stream,
+            model=self._settings.gemini_model,
+            contents=[
+                prompt,
+                self._types.Content(role="model", parts=call_parts),
+                self._types.Content(role="user", parts=response_parts),
+            ],
+            config=config,
         )
         while True:
-            event = await asyncio.to_thread(_next_or_none, iter(stream))
-            if event is None:
+            chunk = await asyncio.to_thread(_next_or_none, iter(follow_up))
+            if chunk is None:
                 break
-            if getattr(event, "event_type", None) != "step.delta":
-                continue
-            delta = getattr(event, "delta", None)
-            if getattr(delta, "type", None) == "text" and getattr(delta, "text", None):
-                yield delta.text
+            if getattr(chunk, "text", None):
+                yield "token", chunk.text
+
+
+
+    async def stream(self, prompt: str) -> AsyncIterator[str]:
+        stream = await asyncio.to_thread(
+            self._client.models.generate_content_stream,
+            model=self._settings.gemini_model,
+            contents=prompt,
+            config=self._generate_content_config(),
+        )
+        while True:
+            chunk = await asyncio.to_thread(_next_or_none, iter(stream))
+            if chunk is None:
+                break
+            if getattr(chunk, "text", None):
+                yield chunk.text
+

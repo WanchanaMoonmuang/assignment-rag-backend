@@ -249,26 +249,24 @@ def install_fake_genai(monkeypatch: pytest.MonkeyPatch, client_cls: type[Any]) -
     monkeypatch.setitem(__import__("sys").modules, "google.genai.types", fake_types)
 
 
-def test_gemini_developer_api_calls_disable_prompt_storage(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_gemini_developer_api_uses_models_api(monkeypatch: pytest.MonkeyPatch) -> None:
     init_calls: list[dict[str, Any]] = []
-    calls: list[dict[str, Any]] = []
+    generate_calls: list[dict[str, Any]] = []
+    stream_calls: list[dict[str, Any]] = []
 
-    class Interactions:
-        def create(self, **kwargs: Any) -> Any:
-            calls.append(kwargs)
-            if kwargs.get("stream"):
-                event = SimpleNamespace(
-                    event_type="step.delta",
-                    delta=SimpleNamespace(type="text", text="streamed"),
-                )
-                return iter([event])
-            return SimpleNamespace(output_text="generated")
+    class Models:
+        def generate_content(self, **kwargs: Any) -> Any:
+            generate_calls.append(kwargs)
+            return SimpleNamespace(text="generated")
+
+        def generate_content_stream(self, **kwargs: Any) -> Any:
+            stream_calls.append(kwargs)
+            return iter([SimpleNamespace(text="streamed")])
 
     class Client:
         def __init__(self, **kwargs: Any) -> None:
             init_calls.append(kwargs)
-            self.interactions = Interactions()
-            self.models = SimpleNamespace()
+            self.models = Models()
 
     install_fake_genai(monkeypatch, Client)
 
@@ -280,10 +278,9 @@ def test_gemini_developer_api_calls_disable_prompt_storage(monkeypatch: pytest.M
 
     assert asyncio.run(collect_stream()) == ["streamed"]
     assert init_calls == [{"api_key": "key"}]
-    assert calls[0]["store"] is False
-    assert calls[1]["store"] is False
-    assert calls[0]["generation_config"]["temperature"] == 0.37
-    assert calls[1]["generation_config"]["temperature"] == 0.37
+    assert generate_calls[0]["config"].kwargs["temperature"] == 0.37
+    assert stream_calls[0]["config"].kwargs["temperature"] == 0.37
+
 
 
 def test_gemini_vertex_ai_uses_project_location_and_model_api(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1120,3 +1117,88 @@ def test_chat_returns_source_metadata(client: TestClient) -> None:
     assert source["chunk_type"] == "prose"
     assert source["location"] == {"page": 2}
     assert source["metadata"] == {"department": "support"}
+
+def test_calculator_supports_safe_math_and_rejects_code() -> None:
+    from app.calculator import CalculatorError, calculate
+
+    assert calculate("sqrt(9) + 2**3") == 11
+    assert calculate("round(pi, 2)") == 3.14
+    with pytest.raises(CalculatorError):
+        calculate("__import__('os')")
+
+
+def test_get_cited_chunk_returns_neighbor_window(client: TestClient) -> None:
+    chunks = app.state.db["document_chunks"].docs
+    for index in range(5):
+        chunks[f"chunk_{index}"] = {
+            "_id": f"chunk_{index}", "document_id": "doc_1", "content": str(index),
+            "chunk_index": index, "location": {"page": 1}, "metadata": {},
+        }
+
+    response = client.get("/api/documents/doc_1/chunks/chunk_2", headers=auth_headers(client))
+
+    assert response.status_code == 200
+    assert [item["chunk_id"] for item in response.json()["neighbors"]] == ["chunk_0", "chunk_1", "chunk_2", "chunk_3", "chunk_4"]
+
+
+def test_get_original_file_returns_private_gcs_bytes(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def download(*args: Any, **kwargs: Any) -> bytes:
+        return b"document bytes"
+
+    monkeypatch.setattr("app.main.download_object", download)
+    app.state.db["documents"].docs["doc_1"] = {
+        "_id": "doc_1", "document_name": "policy.txt", "original_object_name": "originals/doc_1/policy.txt",
+        "content_type": "text/plain",
+    }
+
+    response = client.get("/api/documents/doc_1/file", headers=auth_headers(client))
+
+    assert response.status_code == 200
+    assert response.content == b"document bytes"
+    assert response.headers["content-type"].startswith("text/plain")
+    assert "policy.txt" in response.headers["content-disposition"]
+
+def test_stream_with_calculator_handles_multiple_calls() -> None:
+    calls = [
+        SimpleNamespace(name="calculator", args={"expression": "1 + 1"}),
+        SimpleNamespace(name="calculator", args={"expression": "2 + 2"}),
+    ]
+    model_calls: list[dict[str, Any]] = []
+
+    class Models:
+        def generate_content_stream(self, **kwargs: Any) -> Any:
+            model_calls.append(kwargs)
+            if len(model_calls) == 1:
+                return iter([SimpleNamespace(text=None, function_calls=calls)])
+            return iter([SimpleNamespace(text="done", function_calls=[])])
+
+    class Part:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
+        @staticmethod
+        def from_function_response(**kwargs: Any) -> dict[str, Any]:
+            return kwargs
+
+    client = GeminiClient.__new__(GeminiClient)
+    client._provider = "developer_api"
+    client._settings = SimpleNamespace(gemini_model="test", gemini_temperature=0.2)
+    client._client = SimpleNamespace(models=Models())
+    client._types = SimpleNamespace(
+        FunctionDeclaration=lambda **kwargs: kwargs,
+        Tool=lambda **kwargs: kwargs,
+        GenerateContentConfig=lambda **kwargs: kwargs,
+        Part=Part,
+        Content=lambda **kwargs: kwargs,
+    )
+
+    async def collect() -> list[tuple[str, Any]]:
+        return [item async for item in client.stream_with_calculator("calculate")]
+
+    events = asyncio.run(collect())
+    assert [event for event, _ in events] == ["tool_call", "tool_result", "tool_call", "tool_result", "token"]
+    assert events[0][1] == {"name": "calculator", "status": "requested"}
+    assert events[1][1] == {"name": "calculator", "status": "completed", "display_value": "2"}
+    assert len(model_calls) == 2
+    assert len(model_calls[1]["contents"][1]["parts"]) == 2
+    assert len(model_calls[1]["contents"][2]["parts"]) == 2
