@@ -1,0 +1,137 @@
+
+# Cloud Build — Assignment RAG Backend
+# Triggered on push to: develop
+#
+# Prerequisites:
+#   1. Artifact Registry repository created:
+#        gcloud artifacts repositories create assignment-rag \
+#          --repository-format=docker \
+#          --location=asia-southeast1
+#
+#   2. Secrets created in Secret Manager:
+#        assignment-rag-mongodb-uri
+#        assignment-rag-gemini-api-key
+#        assignment-rag-auth-password
+#        assignment-rag-jwt-secret-key
+#
+#   3. Cloud Build service account granted:
+#        roles/run.admin
+#        roles/iam.serviceAccountUser
+#        roles/artifactregistry.writer
+#
+#   4. Cloud Run runtime service account granted:
+#        roles/secretmanager.secretAccessor
+#        roles/storage.objectAdmin
+#
+# Cloud Build trigger:
+#   Repository: WanchanaMoonmuang/assignment-rag-backend
+#   Branch regex: ^develop$
+#   Configuration file: cloudbuild.yaml
+#
+# Trigger substitution variables can override any value below.
+
+substitutions:
+  _REGION: asia-southeast1
+  _ENV: sit
+  _SERVICE_TYPE: backend
+  _AR_REPO: assignment-rag
+
+  # Cloud Run configuration
+  _MIN_INSTANCES: "1"
+  _MAX_INSTANCES: "1"
+  _CONCURRENCY: "20"
+  _CPU: "1"
+  _MEMORY: 2Gi
+  _TIMEOUT: 3600s
+
+  # Application configuration
+  _FRONTEND_ORIGIN: https://knowledge-assistant-neon.vercel.app
+  _GCS_BUCKET: assignment-rag-90
+
+  _MONGODB_DATABASE: assignment_rag
+  _MONGODB_CHUNK_COLLECTION: document_chunks
+  _MONGODB_DOCUMENT_COLLECTION: documents
+  _MONGODB_CONVERSATION_COLLECTION: conversations
+  _MONGODB_INGESTION_JOB_COLLECTION: ingestion_jobs
+  _MONGODB_VECTOR_INDEX: document_chunks_vector_index
+  _MONGODB_SEARCH_INDEX: document_chunks_text_index
+
+  _GEMINI_PROVIDER: vertex_ai
+  _GEMINI_MODEL: gemini-3.5-flash
+  _GEMINI_EMBEDDING_MODEL: gemini-embedding-2
+  _GEMINI_EMBEDDING_DIMENSIONS: "768"
+
+  _AUTH_USERNAME: admin
+  _ACCESS_TOKEN_EXPIRE_MINUTES: "2880"
+
+  # Secret Manager secret names
+  _SM_MONGODB_URI: assignment-rag-mongodb-uri
+  _SM_AUTH_PASSWORD: assignment-rag-auth-password
+  _SM_JWT_SECRET_KEY: assignment-rag-jwt-secret-key
+
+steps:
+  # ── 1. Build ────────────────────────────────────────────────────────────────
+  - name: gcr.io/cloud-builders/docker
+    id: build
+    env:
+      - DOCKER_BUILDKIT=1
+    args:
+      - build
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE_TYPE}-${_ENV}:$COMMIT_SHA
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE_TYPE}-${_ENV}:latest
+      - .
+
+  # ── 2. Push ─────────────────────────────────────────────────────────────────
+  - name: gcr.io/cloud-builders/docker
+    id: push
+    args:
+      - push
+      - --all-tags
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE_TYPE}-${_ENV}
+    waitFor:
+      - build
+
+  # ── 3. Deploy ────────────────────────────────────────────────────────────────
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    id: deploy
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_AR_REPO}-${_SERVICE_TYPE}-${_ENV}
+
+      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE_TYPE}-${_ENV}:$COMMIT_SHA
+      - --project=$PROJECT_ID
+      - --region=${_REGION}
+      - --platform=managed
+
+      - --allow-unauthenticated
+      - --port=8080
+
+      - --cpu=${_CPU}
+      - --memory=${_MEMORY}
+      - --concurrency=${_CONCURRENCY}
+      - --timeout=${_TIMEOUT}
+
+      - --min-instances=${_MIN_INSTANCES}
+      - --max-instances=${_MAX_INSTANCES}
+      - --no-cpu-throttling
+
+      - --set-secrets=MONGODB_URI=${_SM_MONGODB_URI}:latest,AUTH_PASSWORD=${_SM_AUTH_PASSWORD}:latest,JWT_SECRET_KEY=${_SM_JWT_SECRET_KEY}:latest
+
+      - --set-env-vars=ENVIRONMENT=${_ENV},LOG_LEVEL=info,BACKEND_CORS_ORIGINS=${_FRONTEND_ORIGIN},GOOGLE_CLOUD_PROJECT=$PROJECT_ID,GOOGLE_CLOUD_LOCATION=${_REGION},GCP_PROJECT_ID=$PROJECT_ID,GCS_PROJECT_ID=$PROJECT_ID,GCS_BUCKET_NAME=${_GCS_BUCKET},MONGODB_DATABASE=${_MONGODB_DATABASE},MONGODB_CHUNK_COLLECTION=${_MONGODB_CHUNK_COLLECTION},MONGODB_DOCUMENT_COLLECTION=${_MONGODB_DOCUMENT_COLLECTION},MONGODB_CONVERSATION_COLLECTION=${_MONGODB_CONVERSATION_COLLECTION},MONGODB_INGESTION_JOB_COLLECTION=${_MONGODB_INGESTION_JOB_COLLECTION},MONGODB_VECTOR_INDEX=${_MONGODB_VECTOR_INDEX},MONGODB_SEARCH_INDEX=${_MONGODB_SEARCH_INDEX},GEMINI_PROVIDER=${_GEMINI_PROVIDER},GEMINI_MODEL=${_GEMINI_MODEL},GEMINI_EMBEDDING_MODEL=${_GEMINI_EMBEDDING_MODEL},GEMINI_EMBEDDING_DIMENSIONS=${_GEMINI_EMBEDDING_DIMENSIONS},AUTH_USERNAME=${_AUTH_USERNAME},ACCESS_TOKEN_EXPIRE_MINUTES=${_ACCESS_TOKEN_EXPIRE_MINUTES}
+
+    waitFor:
+      - push
+
+images:
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE_TYPE}-${_ENV}:$COMMIT_SHA
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE_TYPE}-${_ENV}:latest
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+timeout: 1800s
+
