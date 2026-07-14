@@ -16,7 +16,9 @@ SYSTEM_INSTRUCTION = (
     "such as [1] that match the numbered sources. "
     "You may use general knowledge when document context is incomplete, but put those claims "
     "under a 'General knowledge' heading without source markers. "
-    "Do not claim that uncited general knowledge came from a document. Keep the answer clear and concise."
+    "Do not claim that uncited general knowledge came from a document. Keep the answer clear and concise. "
+    "Only use the calculator tool for questions that require an actual numeric computation; "
+    "answer conceptual or document questions directly without it."
 )
 
 
@@ -214,7 +216,11 @@ class GeminiClient:
     def _calculator_config(self) -> Any:
         declaration = self._types.FunctionDeclaration(
             name="calculator",
-            description="Evaluate a mathematical expression.",
+            description=(
+                "Evaluate an explicit arithmetic expression (e.g. '12*7.5', '(3+4)/2'). "
+                "Only call this when the user asks for a concrete numeric calculation. "
+                "Do not call it for conceptual, definitional, or document questions."
+            ),
             parametersJsonSchema={
                 "type": "object",
                 "properties": {"expression": {"type": "string"}},
@@ -311,9 +317,19 @@ class GeminiClient:
             part, record = self._calculator_response_part(function_call)
             response_parts.append(part)
             yield "tool_result", (
-                {"name": function_call.name, "status": "completed", "display_value": str(record["result"])}
+                {
+                    "name": function_call.name,
+                    "arguments": record["arguments"],
+                    "status": "completed",
+                    "display_value": str(record["result"]),
+                }
                 if "result" in record
-                else {"name": function_call.name, "status": "failed", "display_value": "Calculation failed"}
+                else {
+                    "name": function_call.name,
+                    "arguments": record["arguments"],
+                    "status": "failed",
+                    "display_value": "Calculation failed",
+                }
             )
         follow_up = await asyncio.to_thread(
             self._client.models.generate_content_stream,

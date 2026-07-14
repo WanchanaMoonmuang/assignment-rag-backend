@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -7,6 +8,8 @@ import fitz
 import pytest
 
 from app.extraction import ExtractionError, extract_csv, extract_json, extract_markdown, extract_pdf, extract_text
+
+SAMPLES_DIR = Path(__file__).resolve().parent.parent / "samples"
 
 
 def test_text_extraction_uses_exact_line_ranges() -> None:
@@ -23,6 +26,19 @@ def test_pdf_extraction_preserves_page_location() -> None:
 
     assert chunks[0].chunk_type == "prose"
     assert chunks[0].location["label"] == "Page 1"
+
+
+def test_pdf_extraction_does_not_duplicate_table_text_as_prose() -> None:
+    data = (SAMPLES_DIR / "sample-tables.pdf").read_bytes()
+    chunks = extract_pdf(data)
+
+    table_chunks = [chunk for chunk in chunks if chunk.chunk_type == "table"]
+    prose_chunks = [chunk for chunk in chunks if chunk.chunk_type == "prose"]
+    assert table_chunks
+
+    for table_chunk in table_chunks:
+        first_row = table_chunk.content.splitlines()[0]
+        assert not any(first_row in prose_chunk.content for prose_chunk in prose_chunks)
 
 
 def test_csv_extraction_adds_summary_and_bounded_row_locations() -> None:

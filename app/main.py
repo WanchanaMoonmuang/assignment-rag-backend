@@ -820,7 +820,8 @@ async def stream_chat(
                         answer_parts.append(data)
                         yield sse("token", {"text": data})
                     else:
-                        tool_activity.append(data)
+                        if event == "tool_result":
+                            tool_activity.append(data)
                         yield sse(event, data)
             answer = "".join(answer_parts).strip() or FALLBACK_ANSWER
             sources = public_sources(prompt_chunks)

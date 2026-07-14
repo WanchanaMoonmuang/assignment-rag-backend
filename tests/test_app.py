@@ -796,6 +796,42 @@ def test_stream_chat_event_order(client: TestClient) -> None:
     assert "event: sources" in text
     assert "event: done" in text
 
+def test_stream_chat_persists_only_resolved_tool_activity(client: TestClient) -> None:
+    class CalculatorGemini(FakeGemini):
+        async def stream_with_calculator(self, prompt: str):
+            self.stream_prompts.append(prompt)
+            yield "token", "The answer is "
+            yield "tool_call", {"name": "calculator", "status": "requested"}
+            yield "tool_result", {
+                "name": "calculator",
+                "arguments": {"expression": "2+2"},
+                "status": "completed",
+                "display_value": "4",
+            }
+            yield "token", "4."
+
+    app.state.gemini = CalculatorGemini()
+
+    response = client.post(
+        "/api/chat/stream",
+        headers=auth_headers(client),
+        json={"question": "What is 2+2?"},
+    )
+
+    assert response.status_code == 200
+    conversation = next(iter(app.state.db["conversations"].docs.values()))
+    tool_activity = conversation["messages"][-1]["tool_activity"]
+    assert tool_activity == [
+        {
+            "name": "calculator",
+            "arguments": {"expression": "2+2"},
+            "status": "completed",
+            "display_value": "4",
+        }
+    ]
+    assert all(entry["status"] != "requested" for entry in tool_activity)
+
+
 def test_chat_top_k_zero_skips_retrieval(client: TestClient) -> None:
     response = client.post(
         "/api/chat",
@@ -1244,7 +1280,12 @@ def test_stream_with_calculator_handles_multiple_calls() -> None:
     events = asyncio.run(collect())
     assert [event for event, _ in events] == ["tool_call", "tool_result", "tool_call", "tool_result", "token"]
     assert events[0][1] == {"name": "calculator", "status": "requested"}
-    assert events[1][1] == {"name": "calculator", "status": "completed", "display_value": "2"}
+    assert events[1][1] == {
+        "name": "calculator",
+        "arguments": {"expression": "1 + 1"},
+        "status": "completed",
+        "display_value": "2",
+    }
     assert len(model_calls) == 2
     assert len(model_calls[1]["contents"][1]["parts"]) == 2
     assert len(model_calls[1]["contents"][2]["parts"]) == 2
