@@ -1,84 +1,71 @@
 # Backend Handoff
 
-Last updated: 2026-07-13
+Last updated: 2026-07-14
 
 ## Current State
 
-The backend implements the approved V2 scope for asynchronous ingestion, multi-format extraction, hybrid retrieval, configurable generation, citations, calculator tools, and structured observability. Unit and integration-style tests pass, but the latest real local curl run found two unresolved runtime failures. Do not treat the remaining feature stack as locally validated until those failures are fixed and the curl matrix is rerun.
+Backend V2 is complete and validated against `docs/PRDv2.md` §11 acceptance criteria, live
+against real MongoDB Atlas, Vertex AI, and GCS. All prior blockers are resolved. **Next up:
+frontend V2** (per `PRDv2.md`) — the frontend currently remains on V1 behavior and this
+backend stays compatible with it (see V1-compat notes below).
 
 Repository: `poc-rag-backend`
 
-Current branch: `feature/backend-v2-observability`
+Current branch: `fix/backend-v2-completion` (based on `develop`, not yet merged/pushed)
 
 Current committed head:
 
 ```text
-c8e3b30 Add backend observability metrics
+b82dec2 Fix backend V2 runtime bugs found in full PRDv2 validation
 ```
 
-The only local modification at handoff is `docs/test_document.md`, containing the latest curl results. Preserve it.
+`develop` (`bc8c198`) already contains the full V2 feature stack (PRs #4–#8: extraction,
+hybrid retrieval, citations/tools, observability) — no branch-merge work remains.
 
 ## Source Documents
 
 - Shared V2 product contract: `../docs/PRDv2.md`
 - Shared architecture: `../docs/app-architecture.md`
-- Shared metadata strategy: `../docs/metadata.md`
+- Shared metadata strategy: `../docs/rag_metadata_strategy.md`
 - Backend setup and API summary: `README.md`
-- Curl scenarios and historical results: `docs/test_document.md`
+- Full QA log (test cases + bugs, incremental): `docs/QA.md`
+- Prior curl scenarios and historical results: `docs/test_document.md`
 - Search index definitions: `docs/mongodb-vector-index.json` and `docs/mongodb-search-index.json`
 
-## Branch and Merge State
+## What happened this session
 
-`origin/develop` already contains generation, durable ingestion, and the POC API/worker container. GitHub PR #3 was named `feature/backend-v2-extraction`, but its merged second parent is `b7ffb0c` (the container commit), not the later extraction commit `79b1012`. The actual extraction implementation remains unmerged. The remaining branches must be reviewed and merged in this order because each is based on the previous branch:
+The three "runtime blockers" recorded in the previous version of this doc (chat 500 on
+`top_k:0`; worker `ingestion_failed`; `check_config` requiring the wrong provider key) were
+investigated live. Two of them (the chat 500 and the `ingestion_failed`) turned out to be
+**environment misconfiguration in this session's own setup**, not code bugs — see
+"Required Local Configuration" below for the exact values that matter. Only the
+`check_config` issue was a real code bug, and it's fixed.
 
-1. `feature/backend-v2-extraction` at `79b1012`
-2. `feature/backend-v2-hybrid-retrieval` at `fa922e5`
-3. `feature/backend-v2-citations-tools` at `d2b7ebe`
-4. `feature/backend-v2-observability` at `c8e3b30`
+A full live validation against every PRDv2 §11 acceptance criterion (all 24 test cases
+in `docs/QA.md`) then found **four real bugs**, all fixed and re-verified live this
+session:
 
-Relevant history:
+1. **Observability metrics never emitted** — no logging handler was configured anywhere,
+   so `chat_metrics`/`worker_stage` JSON never reached stdout despite the README's claim.
+   Fixed in `app/observability.py`.
+2. **DOCX ingestion always failed** — `markitdown[docx]` extra wasn't declared, so the
+   conversion dependency was missing. Fixed in `pyproject.toml` (+ `uv.lock`).
+3. **File-ingestion race + stale error** — the job became claimable before its GCS upload
+   completed (spurious first-attempt failure, self-healing but wasteful), and a job's
+   `error` field wasn't cleared on a successful retry. Fixed in `app/main.py` (defer job
+   insert until upload succeeds) and `app/worker.py` (`$unset` error on success).
+4. **Calculator tool broken** — the non-streaming path's bare-callable "Automatic Function
+   Calling" never actually invoked the tool (confirmed by monkeypatching); the streaming
+   path's tool call worked but its follow-up answer failed with a Vertex 400 (missing
+   `thought_signature`, a Gemini 3.x "thinking" model requirement) because the follow-up
+   rebuilt the function-call part from scratch instead of reusing the model's own returned
+   content. Fixed in `app/rag.py` — both paths now share a helper and reuse the model's own
+   content object in their follow-up calls.
 
-```text
-c8e3b30 Add backend observability metrics
-d2b7ebe Add citations and calculator tools
-fa922e5 Add hybrid retrieval and runtime config
-79b1012 Add file extraction worker pipeline
-b7ffb0c Run API and worker in POC container
-1531539 Add durable document ingestion jobs
-55f96ff Add configurable chat generation
-```
-
-Before continuing, fetch remote state and verify it again:
-
-```bash
-git fetch origin develop
-git log --oneline --decorate --graph --all -20
-git branch -r --no-merged origin/develop
-```
-
-## Completed Scope
-
-- FastAPI bearer authentication and conversation persistence.
-- Chat history context controlled by `HISTORY_CONTEXT_WINDOW`, default `8`.
-- Gemini Developer API and Vertex AI provider selection.
-- Request Top K range `0-20`, defaulted from `RAG_TOP_K=5`; Top K `0` skips retrieval.
-- MongoDB-backed durable ingestion jobs with leases, retries, timeouts, and terminal cleanup.
-- API and worker can run in one POC container. This requires always-allocated CPU, minimum instances `1`, and maximum instances `1` on Cloud Run.
-- Backend-authoritative 20 MiB limit for pasted text and file uploads.
-- TXT, PDF, DOCX, CSV, and JSON extraction with type/location metadata.
-- Private original-file storage through GCS. The project bucket is `poc-rag-58`.
-- MongoDB Atlas hybrid vector and lexical retrieval using `$rankFusion`.
-- Persisted citations, source-neighbor lookup, and authenticated original-file access.
-- Calculator tool support in non-streaming and streaming generation.
-- Structured JSON chat and worker metrics on stdout, including latency and provider token usage when available; safe estimates are the fallback.
-- Logging call sites exclude prompts, messages, answers, document content, snippets, metadata, calculator values, credentials, and raw model tokens.
-
-Scope 6 received repeated backend QA review. The final review was clear. The committed verification result was:
-
-```text
-ruff check .: passed
-pytest: 60 passed, 1 Starlette/httpx deprecation warning
-```
+Full repro steps, root causes, and re-verification evidence for all four are in
+`docs/QA.md` (BUG-B-001, BUG-B-003, BUG-B-004, BUG-B-005). `uv run ruff check .` passes;
+`uv run pytest` — 62 passed (up from 60 at last handoff; added/updated regression tests
+for each fix).
 
 ## Main Modules
 
@@ -88,21 +75,26 @@ pytest: 60 passed, 1 Starlette/httpx deprecation warning
 - `app/extraction.py`: format-specific extraction and chunk metadata.
 - `app/storage.py`: GCS upload, download, and deletion.
 - `app/calculator.py`: restricted arithmetic evaluator; does not use `eval`.
-- `app/observability.py`: best-effort JSON event emission to stdout.
+- `app/observability.py`: best-effort JSON event emission to stdout (now actually configured — see fix #1 above).
 - `app/settings.py`: validated environment settings.
-- `app/check_config.py`: MongoDB and Atlas index validation; currently has a Vertex configuration bug described below.
-- `tests/test_app.py` and `tests/test_extraction.py`: backend coverage.
+- `app/check_config.py`: MongoDB, Atlas index, and provider-conditional validation.
+- `tests/test_app.py` and `tests/test_extraction.py`: backend coverage (62 tests).
 
 ## Required Local Configuration
 
-Use `.env` for local runtime values but never commit it. Important settings are:
+Use `.env` for local runtime values but never commit it (already gitignored). Important
+settings, with the two corrections found this session called out:
 
 ```text
 GEMINI_PROVIDER=vertex_ai
 GOOGLE_CLOUD_PROJECT or GCP_PROJECT_ID
-GOOGLE_CLOUD_LOCATION=us
+GOOGLE_CLOUD_LOCATION=us          # NOT us-central1 — the configured models
+                                   # (gemini-3.5-flash, gemini-embedding-2) 404 in
+                                   # us-central1 for this project; us/global work.
 MONGODB_URI
-MONGODB_DATABASE
+MONGODB_DATABASE=poc_rag           # this DB's two Atlas Search indexes are set up
+                                   # and READY (document_chunks_vector_index,
+                                   # document_chunks_text_index) — don't recreate them
 MONGODB_VECTOR_INDEX
 MONGODB_SEARCH_INDEX
 GCS_BUCKET_NAME=poc-rag-58
@@ -111,100 +103,48 @@ AUTH_USERNAME=admin
 AUTH_PASSWORD
 ```
 
-Application Default Credentials were working at handoff. Both direct Vertex calls below succeeded using model access from the existing environment:
+`GOOGLE_APPLICATION_CREDENTIALS` must point to a real, readable service-account key file
+(watch for path typos — this session's session-level env var pointed at a hyphenated
+filename that didn't exist; the real file used an underscore). Verify with:
 
-- `GeminiClient.generate(...)`
-- `GeminiClient.generate_with_calculator(...)`
-
-The calculator call returned provider usage metadata: 102 input, 9 output, and 111 total tokens for the diagnostic prompt. Do not write access tokens, credentials, prompts, or document content into logs or committed documentation.
-
-## Current Runtime Blockers
-
-### 1. Chat API returns HTTP 500
-
-On the feature stack, this request returned `500 Internal Server Error` in about 374 ms:
-
-```http
-POST /api/chat
-{"question":"Reply with the word ready.","top_k":0}
+```bash
+uv run python -m app.check_config   # should print "Backend config ok"
 ```
 
-Top K `0` bypasses retrieval, and direct Vertex generation plus direct calculator-enabled generation both succeeded. The failure is therefore in API orchestration, persistence, runtime process state, or another dependency around generation rather than basic Vertex access.
+## V1 Frontend Compatibility (do not break)
 
-Run a clean feature-branch API in the foreground and capture its traceback while repeating the curl request. At handoff, port `8080` was occupied by an older backend process that did not expose `/api/config`; the feature branch was started on `8081`. Avoid testing against a stale process.
+The frontend is intentionally still on V1 and depends on:
+- Chat request field is `question` (PRDv2 §5.7 documents it as `message` — that's a **doc
+  slip**, not an intended API change; the frontend and all backend code use `question`).
+- `POST /api/ingest` (deprecated) must keep delegating to the V2 text-ingestion job.
+- Legacy V1 documents/conversations remain listable, searchable, and deletable.
 
-### 2. Text ingestion worker ends `ingestion_failed`
+## Known POC Limitations (unchanged)
 
-`POST /api/ingestions/text` returned HTTP `202` in about 1.03 s, but the worker changed the job to:
-
-```json
-{
-  "status": "failed",
-  "stage": "failed",
-  "error": {"code": "ingestion_failed", "message": "Unable to process ingestion"}
-}
-```
-
-The public error is intentionally sanitized. Run the worker in the foreground and expose the underlying exception locally. If necessary, invoke the appropriate worker stage directly outside `process_job`, because `process_job` converts unexpected exceptions to the safe `ingestion_failed` error.
-
-Check the complete stage path: claim and lease fencing, text chunking, Vertex embedding, MongoDB transaction/publication, and final stage update. Do not weaken lease checks or return raw exception text to API clients.
-
-### 3. `app.check_config` incorrectly requires a Developer API key
-
-`uv run python -m app.check_config` reports:
-
-```text
-Missing required settings: GEMINI_API_KEY
-```
-
-This is wrong when `GEMINI_PROVIDER=vertex_ai`. The required provider configuration should be conditional:
-
-- Developer API: require `GEMINI_API_KEY`.
-- Vertex AI: require `GOOGLE_CLOUD_PROJECT` or `GCP_PROJECT_ID`, plus `GOOGLE_CLOUD_LOCATION`; ADC must be available at runtime.
-
-Keep the existing MongoDB and search-index checks.
-
-## Recommended Resume Sequence
-
-1. Confirm the branch and preserve `docs/test_document.md`.
-2. Stop or avoid stale local API/worker processes; use known ports and foreground logs.
-3. Reproduce the Top K `0` chat failure and capture the full server traceback.
-4. Reproduce one text-ingestion job with the worker in the foreground and capture the internal exception.
-5. Fix root causes on a new feature branch based on `feature/backend-v2-observability`; also fix conditional provider validation in `app/check_config.py`.
-6. Add the smallest regression tests that fail for each root cause.
-7. Run `uv run ruff check .` and `uv run pytest`.
-8. Run backend QA. Fix and repeat QA until clear.
-9. Start a clean API and worker and rerun every curl scenario below.
-10. Append exact status codes, terminal states, latency, safe token metrics, and cleanup results to `docs/test_document.md`.
-11. Commit and push the integration-fix branch for review. The project owner will merge branches into `develop`.
-
-## Curl Validation Still Required
-
-Use `docs/test_document.md` as the executable baseline. The final pre-merge run must cover:
-
-- Health, login, invalid login, unauthenticated rejection, and `/api/auth/me`.
-- Protected `/api/config`, including Top K and upload limits.
-- Pasted-text ingestion, polling through stages, publication, listing, and deletion.
-- Successful TXT, PDF, DOCX, CSV, and JSON upload/extraction through GCS and the worker.
-- Invalid signature/content, malformed JSON/CSV, unsupported extension, and 20 MiB rejection before upload/job creation.
-- Top K `0`, default Top K, explicit Top K, and invalid `21`.
-- Hybrid retrieval returning ranked chunks and citations.
-- Non-streaming and SSE chat, conversation continuation, and history persistence.
-- Calculator tool activity in chat and SSE, followed by conversation reopen.
-- Source chunk plus neighbors, format-aware location metadata, and authenticated original-file download.
-- Conversation and document deletion, including GCS cleanup state.
-- `chat_metrics`, `worker_stage`, `worker_job`, and `worker_cleanup` output with latency and token fields but no prohibited content.
-- MongoDB vector and lexical index readiness through the corrected `app.check_config`.
-
-## Known POC Limitations
-
-- API and worker share one container and instance. Either process exiting restarts the container, and termination stops both.
-- Cloud Run must keep CPU allocated for the worker loop.
+- API and worker share one container and instance in the POC Cloud Run topology. Either
+  process exiting restarts the container; termination stops both.
+- Cloud Run must keep CPU allocated for the worker loop (always-on, min/max instances 1).
 - MongoDB Atlas 8.0+ and both configured search indexes are required.
-- Atlas indexing is asynchronous; newly published chunks may take several seconds to appear in retrieval.
-- The deployment topology is appropriate for this POC, not a production worker fleet.
-- Non-stream generation cannot measure true first-token latency and reports it as unavailable; streaming measures the first emitted token.
+- Atlas indexing is asynchronous; newly published chunks may take several seconds to
+  appear in retrieval.
+- Non-stream generation cannot measure true first-token latency; streaming measures it.
 - Token counts use provider metadata where supplied and estimates otherwise.
+- One informational, non-reproducible observation from this session: a long-running
+  worker process occasionally had transient GCS download failures that a fresh process
+  didn't reproduce. Not root-caused (didn't recur after restart); not one of the four
+  tracked bugs. Worth a second look if it recurs in a real long-lived deployment.
+
+## Next Steps
+
+1. **Commit is done; push is pending user confirmation** (per project convention, always
+   ask before pushing).
+2. Once pushed, open a PR for `fix/backend-v2-completion` → `develop` for the project
+   owner to review and merge.
+3. **Then: frontend V2**, per `PRDv2.md` §7 (Frontend Requirements) and the rest of the
+   contract — Top K slider from `/api/config`, source-inspection drawer with page/section
+   highlighting, calculator tool-activity UI, citation persistence rendering, etc. The
+   backend's V2 API contract (SSE `metadata`/`tool_call`/`tool_result` events, source
+   endpoints, `/api/config`) is now validated and stable to build against.
 
 ## Development Loop
 
