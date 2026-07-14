@@ -358,6 +358,47 @@ def test_gemini_client_requires_provider_configuration(monkeypatch: pytest.Monke
         GeminiClient(Settings(gemini_provider="unknown", gemini_api_key="key", _env_file=None))
 
 
+def test_check_config_provider_validation_is_conditional() -> None:
+    from app.check_config import provider_missing_settings
+
+    assert provider_missing_settings(
+        Settings(gemini_provider="developer_api", gemini_api_key="key", _env_file=None)
+    ) == []
+    assert provider_missing_settings(
+        Settings(gemini_provider="developer_api", gemini_api_key=None, _env_file=None)
+    ) == ["GEMINI_API_KEY"]
+    assert (
+        provider_missing_settings(
+            Settings(
+                gemini_provider="vertex_ai",
+                google_cloud_project="proj",
+                gcp_project_id=None,
+                google_cloud_location="us",
+                _env_file=None,
+            )
+        )
+        == []
+    )
+    assert provider_missing_settings(
+        Settings(
+            gemini_provider="vertex_ai",
+            google_cloud_project=None,
+            gcp_project_id=None,
+            google_cloud_location="us",
+            _env_file=None,
+        )
+    ) == ["GOOGLE_CLOUD_PROJECT or GCP_PROJECT_ID"]
+    assert provider_missing_settings(
+        Settings(
+            gemini_provider="vertex_ai",
+            google_cloud_project="proj",
+            gcp_project_id=None,
+            google_cloud_location="",
+            _env_file=None,
+        )
+    ) == ["GOOGLE_CLOUD_LOCATION"]
+
+
 def test_chunk_text_overlaps() -> None:
     chunks = chunk_text("abcdefghij", chunk_size=4, chunk_overlap=1)
     assert chunks == ["abcd", "defg", "ghij"]
@@ -1169,7 +1210,8 @@ def test_stream_with_calculator_handles_multiple_calls() -> None:
         def generate_content_stream(self, **kwargs: Any) -> Any:
             model_calls.append(kwargs)
             if len(model_calls) == 1:
-                return iter([SimpleNamespace(text=None, function_calls=calls)])
+                candidate = SimpleNamespace(content=SimpleNamespace(parts=["part-a", "part-b"]))
+                return iter([SimpleNamespace(text=None, function_calls=calls, candidates=[candidate])])
             return iter([SimpleNamespace(text="done", function_calls=[])])
 
     class Part:
@@ -1178,6 +1220,10 @@ def test_stream_with_calculator_handles_multiple_calls() -> None:
 
         @staticmethod
         def from_function_response(**kwargs: Any) -> dict[str, Any]:
+            return kwargs
+
+        @staticmethod
+        def from_text(**kwargs: Any) -> dict[str, Any]:
             return kwargs
 
     client = GeminiClient.__new__(GeminiClient)
@@ -1203,6 +1249,51 @@ def test_stream_with_calculator_handles_multiple_calls() -> None:
     assert len(model_calls[1]["contents"][1]["parts"]) == 2
     assert len(model_calls[1]["contents"][2]["parts"]) == 2
 
+
+def test_generate_with_calculator_reports_activity_and_preserves_model_content() -> None:
+    call = SimpleNamespace(name="calculator", args={"expression": "2 + 2"})
+    model_content = SimpleNamespace(parts=["original-part-with-thought-signature"])
+    candidate = SimpleNamespace(content=model_content)
+    model_calls: list[dict[str, Any]] = []
+
+    class Models:
+        def generate_content(self, **kwargs: Any) -> Any:
+            model_calls.append(kwargs)
+            if len(model_calls) == 1:
+                return SimpleNamespace(text=None, function_calls=[call], candidates=[candidate])
+            return SimpleNamespace(text="4", function_calls=[])
+
+    class Part:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
+        @staticmethod
+        def from_function_response(**kwargs: Any) -> dict[str, Any]:
+            return kwargs
+
+        @staticmethod
+        def from_text(**kwargs: Any) -> dict[str, Any]:
+            return kwargs
+
+    client = GeminiClient.__new__(GeminiClient)
+    client._provider = "developer_api"
+    client._settings = SimpleNamespace(gemini_model="test", gemini_temperature=0.2)
+    client._client = SimpleNamespace(models=Models())
+    client._types = SimpleNamespace(
+        FunctionDeclaration=lambda **kwargs: kwargs,
+        Tool=lambda **kwargs: kwargs,
+        GenerateContentConfig=lambda **kwargs: kwargs,
+        Part=Part,
+        Content=lambda **kwargs: kwargs,
+    )
+
+    answer, activity, _usage = asyncio.run(client.generate_with_calculator("2 + 2"))
+
+    assert answer == "4"
+    assert activity == [{"name": "calculator", "arguments": {"expression": "2 + 2"}, "result": 4}]
+    # The follow-up must reuse the model's own returned content object (which carries
+    # any required thought_signature) rather than rebuilding a function-call Part.
+    assert model_calls[1]["contents"][1] is model_content
 
 
 def test_chat_emits_redacted_metrics(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:

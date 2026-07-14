@@ -211,34 +211,7 @@ class GeminiClient:
         return (getattr(response, "text", "") or "").strip()
 
 
-    async def generate_with_calculator(
-        self, prompt: str
-    ) -> tuple[str, list[dict[str, Any]], dict[str, int] | None]:
-        activity: list[dict[str, Any]] = []
-
-        def calculator(expression: str) -> dict[str, Any]:
-            try:
-                result = calculate(expression)
-                record = {"name": "calculator", "arguments": {"expression": expression}, "result": result}
-            except CalculatorError as exc:
-                record = {"name": "calculator", "arguments": {"expression": expression}, "error": str(exc)}
-            activity.append(record)
-            return record
-
-        response = await asyncio.to_thread(
-            self._client.models.generate_content,
-            model=self._settings.gemini_model,
-            contents=prompt,
-            config=self._types.GenerateContentConfig(
-                system_instruction=SYSTEM_INSTRUCTION,
-                temperature=self._settings.gemini_temperature,
-                tools=[calculator],
-            ),
-        )
-        return (getattr(response, "text", "") or "").strip(), activity, provider_usage(response)
-
-
-    async def stream_with_calculator(self, prompt: str) -> AsyncIterator[tuple[str, Any]]:
+    def _calculator_config(self) -> Any:
         declaration = self._types.FunctionDeclaration(
             name="calculator",
             description="Evaluate a mathematical expression.",
@@ -248,11 +221,62 @@ class GeminiClient:
                 "required": ["expression"],
             },
         )
-        config = self._types.GenerateContentConfig(
+        return self._types.GenerateContentConfig(
             system_instruction=SYSTEM_INSTRUCTION,
             temperature=self._settings.gemini_temperature,
             tools=[self._types.Tool(functionDeclarations=[declaration])],
         )
+
+    def _calculator_response_part(self, function_call: Any) -> tuple[Any, dict[str, Any]]:
+        arguments = dict(function_call.args or {})
+        try:
+            result = calculate(str(arguments.get("expression", "")))
+            record = {"name": function_call.name, "arguments": arguments, "result": result}
+            response_data: dict[str, Any] = {"result": result}
+        except CalculatorError as exc:
+            record = {"name": function_call.name, "arguments": arguments, "error": str(exc)}
+            response_data = {"error": str(exc)}
+        part = self._types.Part.from_function_response(name=function_call.name, response=response_data)
+        return part, record
+
+    async def generate_with_calculator(
+        self, prompt: str
+    ) -> tuple[str, list[dict[str, Any]], dict[str, int] | None]:
+        config = self._calculator_config()
+        response = await asyncio.to_thread(
+            self._client.models.generate_content,
+            model=self._settings.gemini_model,
+            contents=prompt,
+            config=config,
+        )
+        function_calls = list(getattr(response, "function_calls", None) or [])
+        if not function_calls:
+            return (getattr(response, "text", "") or "").strip(), [], provider_usage(response)
+
+        activity: list[dict[str, Any]] = []
+        response_parts = []
+        for function_call in function_calls:
+            part, record = self._calculator_response_part(function_call)
+            response_parts.append(part)
+            activity.append(record)
+
+        follow_up = await asyncio.to_thread(
+            self._client.models.generate_content,
+            model=self._settings.gemini_model,
+            # Reuse the model's own returned content (not a hand-built Part) so the
+            # required thought_signature on the function-call part is preserved.
+            contents=[
+                self._types.Content(role="user", parts=[self._types.Part.from_text(text=prompt)]),
+                response.candidates[0].content,
+                self._types.Content(role="user", parts=response_parts),
+            ],
+            config=config,
+        )
+        return (getattr(follow_up, "text", "") or "").strip(), activity, provider_usage(follow_up)
+
+
+    async def stream_with_calculator(self, prompt: str) -> AsyncIterator[tuple[str, Any]]:
+        config = self._calculator_config()
         self._usage_context().set(None)
         stream = await asyncio.to_thread(
             self._client.models.generate_content_stream,
@@ -261,6 +285,7 @@ class GeminiClient:
             config=config,
         )
         function_calls: list[Any] = []
+        call_parts: list[Any] = []
         while True:
             chunk = await asyncio.to_thread(_next_or_none, iter(stream))
             if chunk is None:
@@ -270,41 +295,31 @@ class GeminiClient:
                 self._usage_context().set(usage)
             if getattr(chunk, "text", None):
                 yield "token", chunk.text
-            function_calls.extend(getattr(chunk, "function_calls", None) or [])
+            chunk_calls = getattr(chunk, "function_calls", None) or []
+            if chunk_calls:
+                function_calls.extend(chunk_calls)
+                candidates = getattr(chunk, "candidates", None) or []
+                if candidates and candidates[0].content and candidates[0].content.parts:
+                    # Preserve the model's own parts (incl. thought_signature) rather
+                    # than reconstructing Part(functionCall=...) from scratch.
+                    call_parts.extend(candidates[0].content.parts)
         if not function_calls:
             return
         response_parts = []
-        call_parts = []
         for function_call in function_calls:
-            arguments = dict(function_call.args or {})
             yield "tool_call", {"name": function_call.name, "status": "requested"}
-            try:
-                result = calculate(str(arguments.get("expression", "")))
-                response_data = {"result": result}
-                yield "tool_result", {
-                    "name": function_call.name,
-                    "status": "completed",
-                    "display_value": str(result),
-                }
-            except CalculatorError as exc:
-                response_data = {"error": str(exc)}
-                yield "tool_result", {
-                    "name": function_call.name,
-                    "status": "failed",
-                    "display_value": "Calculation failed",
-                }
-            call_parts.append(self._types.Part(functionCall=function_call))
-            response_parts.append(
-                self._types.Part.from_function_response(
-                    name=function_call.name,
-                    response=response_data,
-                )
+            part, record = self._calculator_response_part(function_call)
+            response_parts.append(part)
+            yield "tool_result", (
+                {"name": function_call.name, "status": "completed", "display_value": str(record["result"])}
+                if "result" in record
+                else {"name": function_call.name, "status": "failed", "display_value": "Calculation failed"}
             )
         follow_up = await asyncio.to_thread(
             self._client.models.generate_content_stream,
             model=self._settings.gemini_model,
             contents=[
-                prompt,
+                self._types.Content(role="user", parts=[self._types.Part.from_text(text=prompt)]),
                 self._types.Content(role="model", parts=call_parts),
                 self._types.Content(role="user", parts=response_parts),
             ],

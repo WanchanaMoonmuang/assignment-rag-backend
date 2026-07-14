@@ -243,7 +243,7 @@ async def publish_job(
                         "completed_at": now_utc(),
                         "updated_at": now_utc(),
                     },
-                    "$unset": {"lease_owner": "", "lease_token": "", "lease_expires_at": ""},
+                    "$unset": {"lease_owner": "", "lease_token": "", "error": "", "lease_expires_at": ""},
                 },
                 session=session,
             )

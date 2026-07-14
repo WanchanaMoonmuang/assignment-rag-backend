@@ -1,0 +1,138 @@
+# Backend QA Log
+
+## 2026-07-13 — Full PRDv2 §11 acceptance validation (branch: fix/backend-v2-completion, commit: pending)
+
+Environment: live services (MongoDB Atlas `poc_rag`, Vertex AI `gemini-3.5-flash` / `gemini-embedding-2` in `us` location, GCS `poc-rag-58`). Checks: `ruff check .` — all checks passed. `pytest` — 61 passed.
+
+### Test cases
+
+| ID | Scenario | Steps / request | Expected | Actual | Status |
+| --- | --- | --- | --- | --- | --- |
+| BQA-001 | Chat with retrieval disabled | `POST /api/chat {"top_k":0}` | 200, answer, no citations | 200, correct answer, `sources: []` | PASS |
+| BQA-002 | Text ingestion end-to-end | `POST /api/ingestions/text` → poll → chat retrieval | job completes, chunk retrievable with citation | completed, cited correctly | PASS |
+| BQA-003 | PDF ingestion + page citations | Upload real 2-page PDF (`fitz`-generated) | completes, page-range citations | completed (after 1 retry, see BUG-B-004), citations `Page 1`/`Page 2` correct | PASS (with caveat — see BUG-B-004) |
+| BQA-004 | CSV ingestion + table-aware extraction | Upload CSV with headers + numeric rows | completes, summary + row-range chunks, numbers preserved | completed (after 1 retry, see BUG-B-004), `chunk_type: summary` with correct min/max/mean, `chunk_type: table` with row range, answerable via chat | PASS (with caveat — see BUG-B-004) |
+| BQA-005 | JSON ingestion + record citations | Upload JSON array of 2 objects | completes, per-record citations | completed cleanly, `location: {type: record, path: "$[0]"/"$[1]"}` | PASS |
+| BQA-006 | DOCX ingestion | Upload structurally valid `.docx` | completes, section citations | **fails every time** — see BUG-B-003 | FAIL |
+| BQA-007 | `top_k` upper bound rejection | `POST /api/chat {"top_k":21}` | 422 | 422 with clear validation detail | PASS |
+| BQA-008 | `top_k` at max valid value | `POST /api/chat {"top_k":20}` | 200, up to 20 chunks, multi-document | 200, 8 sources spanning PDF/JSON/TXT/CSV | PASS |
+| BQA-009 | `top_k` omitted → default | `POST /api/chat` with no `top_k` | uses `RAG_TOP_K`=5 | 200, 5 sources returned | PASS |
+| BQA-010 | No relevant content → general knowledge | Ask about a topic absent from ingested docs | answer, no forced legacy refusal | answered helpfully, described what IS available, no citations forced | PASS |
+| BQA-011 | Non-English question | Ask in Spanish | answer follows question's language | correct, fluent Spanish answer with citations | PASS |
+| BQA-012 | Multi-turn history | 2 chat turns in same `conversation_id`, second referencing first implicitly | follow-up answer uses context | correctly answered the implicit follow-up ("what about digital goods") | PASS |
+| BQA-013 | Citation persistence on reopen | `GET /api/conversations/{id}` after a cited chat | identical sources returned, not re-retrieved | full source objects persisted verbatim | PASS |
+| BQA-014 | Chunk + neighbor inspection | `GET /api/documents/{doc}/chunks/{chunk}` | chunk + neighbors + location | correct chunk, correct location, neighbors returned | PASS |
+| BQA-015 | Original file requires auth | `GET /api/documents/{doc}/file` with no token | 401 | 401 `Not authenticated` | PASS |
+| BQA-016 | Calculator, non-streaming, simple expression | `POST /api/chat {"question":"47*89"}` | correct result, tool visible | correct answer BUT empty `tool_activity` (inconclusive on its own) | PASS (answer) / see BUG-B-005 |
+| BQA-017 | Calculator, non-streaming, hard expression | Large multiplication+subtraction requiring the tool | correct result, tool visible | **wrong answer**, empty `tool_activity` | FAIL — BUG-B-005 |
+| BQA-018 | Calculator, SSE streaming | Same hard expression via `/api/chat/stream` | `tool_call`/`tool_result` events + final answer | tool events correct and exact, but stream **ends in `error` event, no final answer** | FAIL — BUG-B-005 |
+| BQA-019 | Deprecated V1 `/api/ingest` compat | `POST /api/ingest` | 202, same job pipeline as V2 text ingestion | 202, job queued and completed normally | PASS |
+| BQA-020 | Observability metrics content safety | Inspect `chat_metrics` JSON (handler attached manually for inspection) | latency/token/score fields present, no prompts/content/credentials | confirmed — see BUG-B-001 for why it's invisible by default | PASS (content) / see BUG-B-001 (emission) |
+| BQA-021 | Idempotency (code review only — not exercised live) | Review `publish_job` transaction + job-lease claim filter | retry doesn't duplicate documents/chunks | `job_filter` requires matching `lease_token` on every update; `publish_job` inserts document + chunks + completes job in one transaction — a retried claim after a crash mid-transaction would re-run `publish_job` fully, and since chunk `_id`s are freshly generated (`make_id("chunk")`) on each call, a crash *after* the transaction commits but *before* the worker acknowledges could theoretically not duplicate (transaction is atomic), but a crash mid-`publish_job` before the transaction starts and a subsequent retry looks safe. No live duplicate observed in testing. | PASS (by review) |
+| BQA-022 | Timeout handling (code review only) | Review `asyncio.wait_for(..., timeout=settings.ingestion_processing_timeout_seconds)` in `process_job` | timeout terminates + retries within limit | `app/worker.py` wraps processing in `asyncio.wait_for` and catches `TimeoutError` → `processing_timeout` error code, routed through the same `mark_job_failed` retry/terminal logic as other failures | PASS (by review) |
+| BQA-023 | Full-file oversize rejection (413) | Code review of `create_file_ingestion`/`create_text_ingestion` | reject before conversion/upload | both endpoints check byte length before any GCS/worker interaction and raise 413 pre-emptively | PASS (by review; not exercised with an actual 20MiB+ payload this run) |
+| BQA-024 | Content/extension mismatch (415) | Code review of `validated_content_type` | mismatched content → 415 | signature checks per format (PDF magic bytes, DOCX zip+`word/document.xml`, JSON parse, UTF-8 decode) all raise 415 on mismatch | PASS (by review) |
+
+### Bugs
+
+- **BUG-B-001** (severity: high, status: fixed) — Structured observability metrics (`chat_metrics`, `worker_stage`, `worker_job`, `worker_cleanup`) are never actually emitted in a running process.
+  - Repro: start the API (`uv run uvicorn app.main:app --port <N>`) and worker (`uv run python -m app.worker`) exactly as documented (no special flags), drive any chat or ingestion request, and grep the process stdout for `chat_metrics`/`worker_stage` — nothing appears, even though the request succeeds.
+  - Observed: `app/observability.py`'s `emit()` calls `logger.info(json.dumps(...))` against `logging.getLogger("app.metrics")`. Nothing in `app/main.py`, `app/worker.py`, or the `Dockerfile` CMD ever calls `logging.basicConfig()` or attaches a handler to the root logger. Python's root logger defaults to level `WARNING` with zero handlers, so every `INFO`-level `emit()` call is silently dropped. Confirmed by attaching a temporary `logging.basicConfig(level=logging.INFO)` in a throwaway harness script (not committed) — the exact same `emit()` calls then print correctly-shaped JSON (see below), proving the bug is purely missing logging configuration, not `emit()`'s logic.
+  - Suspected root cause: missing `logging.basicConfig(...)` (or equivalent handler/level setup) in `app/main.py`'s app startup (e.g. `lifespan`) and `app/worker.py`'s `run()`.
+  - Verified-safe payload shape once a handler is attached (from a real live chat request): `{"event":"chat_metrics","request_id":"req_...","conversation_id":"conv_...","provider":"vertex_ai","model":"gemini-3.5-flash","requested_top_k":5,"effective_top_k":5,"tool_names":[],"request_total_ms":3238.29,"status":"completed","retrieval_ms":1318.17,"prompt_build_ms":0.07,"model_first_token_ms":null,"model_total_ms":1439.07,"input_tokens":198,"output_tokens":25,"total_tokens":223,"token_source":"provider","retrieved_chunks":1,"scores":[0.0327...]}` — no prompts/answers/document content/snippets/credentials present. Content design is correct; only emission is broken.
+  - Fix / re-verified: fixed in `app/observability.py` — the `app.metrics` logger now gets `setLevel(INFO)` + a dedicated `StreamHandler` (with `propagate = False` so other loggers are unaffected) at module load, so both `app/main.py` and `app/worker.py` pick it up automatically via their existing `from app.observability import emit` import — fixed once, at the single place `emit()` lives. Re-verified live: started a plain `uv run uvicorn app.main:app` with no special flags and drove a real chat request; `chat_metrics` appeared in stdout with the same safe shape as before, no code changes needed to see it.
+
+- **BUG-B-003** (severity: high, status: fixed) — DOCX ingestion always fails; the `markitdown[docx]` optional dependency is not declared.
+  - Repro: build any structurally valid `.docx` (proper `[Content_Types].xml`, `_rels/.rels`, `word/document.xml`) and call `app.extraction.extract(data, ".docx", 900, 150)` directly, or upload it via `POST /api/ingestions/file`.
+  - Observed: `MarkItDown().convert(...)` raises `markitdown._exceptions.FileConversionException` wrapping `DocxConverter ... MissingDependencyException: ... include the optional dependency [docx] or [all] when installing MarkItDown ... pip install markitdown[docx]`. `app/extraction.py:258-260` catches this and re-raises as `ExtractionError("Document could not be converted")`, so the failure is clean (surfaces as a safe `extraction_failed` job error, no partial/corrupt data) — but DOCX ingestion, an explicit PRDv2 §4.4/§11.1 requirement, never succeeds regardless of input validity.
+  - Suspected root cause: `pyproject.toml:10` declares `"markitdown>=0.1.6"` with no extras. Needs `"markitdown[docx]>=0.1.6"` (or `markitdown[all]`) so `python-docx`/related deps are installed.
+  - Fix / re-verified: fixed — `pyproject.toml` now declares `"markitdown[docx]>=0.1.6"`; `uv sync --extra dev` installed `mammoth`/`lxml`/`cobble`. Re-verified live end-to-end: uploaded a real `.docx` via `POST /api/ingestions/file`, job reached `completed`, and a follow-up chat question correctly cited both the prose and table chunks from the document.
+
+- **BUG-B-004** (severity: medium, status: fixed) — File ingestion has a race between job-claimability and GCS upload completion, plus the job's stale `error` field is never cleared on a successful retry.
+  - Repro: `POST /api/ingestions/file` with a real PDF, then poll `GET /api/ingestions/{job_id}` until terminal, then inspect the raw job document.
+  - Observed: job `job_11ffab9d2bad41f4af85b7fb8b458d89` (`sample.pdf`) ended with `status: completed`, `attempts: 2`, and a **populated** `error: {code: extraction_failed, message: "Original file could not be downloaded"}` — i.e. attempt 1 failed to download the object from GCS (raised in `process_file_job`, `app/worker.py` ~277-282), attempt 2 succeeded (chunks are correctly retrievable via chat with proper page citations), but the leftover `error` from attempt 1 was never cleared. `GET /api/ingestions/{job_id}` (`serialize_job`, `app/main.py:386-394`) returns `job.get("error")` unconditionally, so a client polling this endpoint sees `status: completed` alongside a populated `error` object — a confusing/contradictory contract, and arguably a §4.5 job-state-clarity violation (docs describe failed jobs as retaining a safe error, but say nothing about completed jobs also showing one).
+  - Suspected root cause (two parts):
+    1. Race: `create_file_ingestion` (`app/main.py` ~496-506) does `job_col(...).insert_one(job)` (making the job immediately claimable, status `queued`) BEFORE `await upload_object(...)` completes. The worker's poll loop (`app/worker.py`'s `run()`, ~1s idle poll) can claim the job and attempt `download_object` in that window, before the object actually exists in GCS — causing a spurious first-attempt failure that only self-heals via retry. Under real GCS latency or a busy worker, this could exhaust `INGESTION_JOB_MAX_ATTEMPTS` (default 3) and terminally fail a perfectly valid upload.
+    2. Stale error: `publish_job`'s success path (`app/worker.py` ~237-249) `$set`s `status`/`stage`/`completed_at`/`updated_at` and `$unset`s lease fields, but never `$unset`s `error` from a prior failed attempt.
+  - Fix / re-verified: fixed. `create_file_ingestion` (`app/main.py`) now defers `job_col(...).insert_one(job)` until after `upload_object` succeeds (on upload failure it inserts the job directly in a `failed` state instead), so the job is never claimable before the object exists in GCS. `publish_job`'s success update (`app/worker.py`) now also `$unset`s `error`. Re-verified live: uploaded a fresh PDF, job completed with `attempts: 1` and `error: None` (previously `attempts: 2` with a stale populated `error`).
+
+- **BUG-B-005** (severity: high, status: fixed) — Calculator tool is unreliable on the non-streaming path and broken on the streaming path.
+  - Repro (non-streaming): `POST /api/chat {"question":"Calculate 8492734 * 173829 - 5566 using the calculator tool.","top_k":0}`.
+  - Observed (non-streaming): answer was `1,476,283,556,920`; ground truth (verified via Python) is `1,476,283,452,920` — **wrong**, confidently presented, with an intermediate step also wrong (`8492734 × 173829 = 1,476,283,562,486` vs true `1,476,283,458,486`). `tool_activity` was `[]` despite the server log showing `AFC remote call 1 is done.` / `AFC remote call 2 is done.` — i.e. Vertex's Automatic Function Calling DID invoke the `calculator` closure in `GeminiClient.generate_with_calculator` (`app/rag.py` ~214-238) twice, but the `activity` list returned to the caller stayed empty, so (a) the client can't see that a tool ran, and (b) whatever the tool actually computed was overridden or ignored by the model's final text, which is simply wrong. A simpler case (`47 * 89`) returned the correct answer with empty `tool_activity` too, but that one is easy enough a model could compute it unaided, so it doesn't prove the tool fired correctly — the harder case does prove it's broken.
+  - Repro (streaming): `POST /api/chat/stream` with the same question.
+  - Observed (streaming): `tool_call`/`tool_result` events fire correctly and the result is exactly correct (`"display_value": "1476283452920"` — matches ground truth), but the stream then ends with `event: error, data: {"message": "Unable to generate response"}` instead of a final answer. Server log shows the follow-up `generateContent` call (`app/rag.py` `stream_with_calculator`, ~303-311) returns `400 Bad Request` from Vertex, preceded by `Warning: there are non-text parts in the response: ['function_call']`. Suspected root cause: the follow-up call's `contents` list mixes a raw prompt string with explicit `Content` objects (`[prompt, Content(role="model", parts=call_parts), Content(role="user", parts=response_parts)]`) instead of a well-formed `Content(role="user", ...)` wrapper for the prompt — likely malformed multi-turn structure that Vertex rejects.
+  - Root cause (confirmed via isolated repro before fixing): the bare-Python-callable "Automatic Function Calling" style used by `generate_with_calculator` never actually invoked the closure — confirmed by monkeypatching `calculate` and observing it was never called even while the SDK logged "AFC remote call N is done." The `stream_with_calculator` path's explicit `FunctionDeclaration` approach DID correctly invoke the tool, but its follow-up call failed with `400 Function call is missing a thought_signature` because it rebuilt `Part(functionCall=function_call)` from scratch instead of reusing the model's own returned content (which carries the required signature for this "thinking" model).
+  - Fix / re-verified: fixed. Rewrote `generate_with_calculator` to use the same explicit `FunctionDeclaration`/manual-round-trip pattern as `stream_with_calculator` (shared via a new `_calculator_config`/`_calculator_response_part` helper), and both methods' follow-up calls now reuse the model's own returned content object (`response.candidates[0].content` for non-streaming; accumulated `chunk.candidates[0].content.parts` for streaming) instead of hand-building function-call parts. Re-verified live with a hard expression (`8492734 * 173829 - 5566`, ground truth `1476283452920` confirmed via Python): non-streaming now returns the correct answer with `tool_activity` populated; streaming now emits correct `tool_call`/`tool_result` events followed by a correct streamed final answer and a `done` event (previously ended in an `error` event with no answer). Added regression tests (`test_generate_with_calculator_reports_activity_and_preserves_model_content`, and an updated `test_stream_with_calculator_handles_multiple_calls`) asserting the follow-up call reuses the model's own content object.
+
+- **BUG-B-002** (severity: none — false alarm, resolved) — `docs/handoff.md`'s two "runtime blockers" (`POST /api/chat {top_k:0}` → 500; text ingestion worker → `ingestion_failed`) do not reproduce on this branch. Root-caused live: they were caused by environment misconfiguration in this session's first setup attempt (`GOOGLE_CLOUD_LOCATION=us-central1` instead of the required `us`, and a credentials file path mismatch), not code defects. Once corrected, both flows work end-to-end (see BQA-001, BQA-002 below). Logged here only for continuity with the handoff doc; no code change needed.
+
+## 2026-07-14 — Phase 3 gap-fix verification (branch: fix/backend-v2-completion)
+
+All four bugs found in the 2026-07-13 validation run (BUG-B-001, BUG-B-003, BUG-B-004, BUG-B-005) are fixed and re-verified live, per the notes attached to each bug above. Summary:
+
+- `uv run ruff check .` — all checks passed.
+- `uv run pytest` — 62 passed (added `test_check_config_provider_validation_is_conditional`, `test_generate_with_calculator_reports_activity_and_preserves_model_content`; updated `test_stream_with_calculator_handles_multiple_calls`'s mock to include `candidates[0].content.parts`).
+- Live re-verification (fresh API + worker, real MongoDB Atlas/Vertex AI/GCS): DOCX ingestion end-to-end with citations; PDF ingestion in exactly 1 attempt with no stale `error`; calculator correct on both `/api/chat` (with populated `tool_activity`) and `/api/chat/stream` (with `tool_call`/`tool_result` events followed by a correct answer and `done`); `chat_metrics` visible in plain stdout with no special configuration.
+- One non-reproducible observation during re-verification: a long-running worker process (several hours old, having processed dozens of jobs across this session) intermittently failed GCS downloads that succeeded instantly from a fresh process/script. Restarting the worker resolved it every time. Not one of the four tracked bugs — no code fix applied — noting it here in case it recurs in a real long-lived deployment; possibly sandboxed-environment GCS client degradation under heavy iteration, not confirmed to be a production concern.
+
+Test-case status updates from the prior run: BQA-003, BQA-004 no longer need the "with caveat" qualifier (race eliminated); BQA-006, BQA-017, BQA-018 flip from FAIL to PASS; BQA-020's emission caveat is resolved.
+
+## 2026-07-14 — Full-loop PRD re-validation (branch: fix/backend-v2-completion)
+
+Re-ran the full feature set against PRDv2 live (fresh MongoDB Atlas/Vertex AI/GCS, no
+mocks), specifically exercising several items the prior run had only verified by code
+review. Test IDs continue from BQA-024.
+
+| ID | Case | Steps | Expected | Actual | Result |
+|----|------|-------|----------|--------|--------|
+| BQA-025 | Multi-document comparison (live, not code review) | Ingested two short documents with distinct comparable facts (drone weight/price/flight-time), asked a comparison question via `/api/chat` with no `document_id` filter | answer compares both, citations reference both source documents (PRDv2 §11: "a comparison fixture retrieves relevant chunks from at least two documents ... without document selection") | answer correctly stated both drones' weight/price/flight-time with `[1]`/`[2]` citations mapping to the two distinct `document_id`s; no manual selection used | PASS |
+| BQA-026 | Idempotency / crash-recovery (live, not code review) | Queued a job, then directly set it to `status: processing`, `stage: chunking`, `attempts: 1`, an **expired** `lease_expires_at` (simulating a worker that claimed the job and crashed mid-processing) via a MongoDB write; started a fresh worker | fresh worker reclaims via the `processing` + expired-lease branch of `claim_job`'s filter, completes at `attempts: 2`, exactly one set of chunks (no duplicates from the "crashed" first attempt) | worker log showed `attempt=2`, full stage pipeline completed; chunk collection had exactly 1 chunk for that document | PASS |
+| BQA-027 | Ingestion timeout handling | Existing automated regression test `tests/test_app.py::test_worker_records_processing_timeout` — monkeypatches `process_text_job` to outlast `ingestion_processing_timeout_seconds`, asserts `error.code == "processing_timeout"` | timeout raises inside `process_job`'s `asyncio.wait_for`, routes through the same failure/retry path as other errors | test passes (part of the 62-test suite); exercises the real `process_job` code path, not just a read-through | PASS — upgraded from BQA-022's "code review only" |
+| BQA-028 | Document deletion + GCS cleanup lifecycle (live) | Ingested a document, then `DELETE /api/documents/{id}` | chunks deleted, document deleted, GCS original object deleted (`cleanup_completed`), re-downloading the object 404s | all confirmed: chunks gone, document gone, GCS object gone, cleanup job terminal at `cleanup_completed` | PASS |
+| BQA-029 | Reject oversized/malformed/mismatched ingestion payloads (live, not code review) | Oversized text, oversized file, fake-signature "PDF", malformed JSON, malformed CSV, unsupported `.exe` extension, each via the real endpoints | 413 for size, 415 for signature/format mismatches, clean `extraction_failed` (not a crash) for structurally-invalid-but-accepted formats like CSV | oversized text → 413; oversized file → 413; fake PDF signature → 415; malformed JSON → 415 at upload; malformed CSV → 202 at upload then a clean worker-stage `extraction_failed` ("CSV rows must match the header columns"); `.exe` → 415 | PASS — upgraded from BQA-023/BQA-024's "code review only" |
+
+### Observability re-investigation (BUG-B-001 correction)
+
+The 2026-07-13 fix for BUG-B-001 (missing `logging` handler in `app/observability.py`) was
+only cleanly re-verified live for the **API** process in that session; this round set out
+to confirm the **worker** process's `worker_stage`/`worker_job` events the same way, and
+initially could not reproduce reliable output — plain `uv run python -m app.worker` runs
+showed zero log lines even though jobs completed correctly every time, across roughly a
+dozen different hypotheses (stream target, line-buffering, `PYTHONUNBUFFERED`, a startup
+probe line, swallowed-exception checks).
+
+**Root cause, found via a `/proc` scan (not `ps aux`, which reported nothing running):**
+this long session had accumulated **~40 leftover `uv run python -m app.worker` and
+`uvicorn` processes** from earlier test rounds, all still alive and polling MongoDB. Job
+claims are atomic (`find_one_and_update`), so whichever stray instance won the race
+processed the job — not necessarily the one actually being tested — which explains the
+inconsistent, seemingly buffering-related symptoms across many "fixes." None of those
+fixes were the real cause. Killing every stray process and re-testing with exactly one
+worker instance showed the original fix works correctly and deterministically: every
+`worker_stage`/`worker_job` event for a real job appears in stdout, in order, every time.
+
+- **Genuine fix kept and committed** (commit `94e3688`): `app/observability.py` now
+  explicitly binds `logging.StreamHandler(stream=sys.stdout)` (the previous version used
+  the bare `StreamHandler()` default, which is `stderr`) and force-enables line-buffering
+  on `sys.stdout`. This is correct regardless of the process-leak issue above and is a
+  reasonable safeguard for Cloud Run's stdout-only capture.
+- **No code change was needed or made for the worker-specific "invisible logs" symptom**
+  — it was a test-environment artifact (leftover background processes from a long
+  session), not a defect in `app/worker.py` or `app/observability.py`. `docs/handoff.md`
+  and this file are corrected accordingly: BUG-B-001 is fixed for both API and worker
+  processes, confirmed live for both.
+- Practical takeaway for future long debugging sessions in this environment: `ps aux`
+  can fail to show processes started via `&`/`disown` in earlier shell invocations even
+  though they're still alive; scan `/proc/*/cmdline` directly and kill stragglers before
+  trusting a "flaky" result.
+
+### Cleanup
+
+All test/debug documents created during this round and the observability investigation
+(19 total, e.g. `zephyr-x200.txt`, `idempotency-test.txt`, various `*-probe.txt`/
+`*-test.txt` artifacts) were deleted via `DELETE /api/documents/{id}` after validation;
+`GET /api/documents` confirmed the collection is empty of test artifacts. All test API
+server and worker processes for this round were killed after use.
+
+`uv run ruff check .` — all checks passed. `uv run pytest` — 62 passed (unchanged from
+Phase 3; no test code needed to change for this round's findings).

@@ -501,25 +501,19 @@ async def create_file_ingestion(
         object_name=object_name,
         content_type=content_type,
     )
-    await job_col(db, settings).insert_one(job)
+    # Insert the job only once the upload outcome is known, so it never becomes
+    # claimable before the object actually exists in GCS (a claim-before-upload
+    # race otherwise causes a spurious first-attempt "could not be downloaded").
     try:
         await upload_object(settings, object_name, data, content_type)
     except Exception:
-        await job_col(db, settings).update_one(
-            {"_id": job["_id"]},
-            {
-                "$set": {
-                    "status": "failed",
-                    "stage": "failed",
-                    "error": {"code": "original_upload_failed", "message": "Original file upload failed"},
-                    "updated_at": now_utc(),
-                }
-            },
-        )
         job["status"] = "failed"
         job["stage"] = "failed"
         job["error"] = {"code": "original_upload_failed", "message": "Original file upload failed"}
+        await job_col(db, settings).insert_one(job)
         await schedule_cleanup(db, settings, document_id, filename, object_name)
+        return serialize_job(job)
+    await job_col(db, settings).insert_one(job)
     return serialize_job(job)
 
 
