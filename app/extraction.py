@@ -167,6 +167,12 @@ def _table_chunks(
     return chunks
 
 
+def _overlaps(block_bbox: tuple[float, float, float, float], table_bbox: tuple[float, float, float, float]) -> bool:
+    bx0, by0, bx1, by1 = block_bbox
+    tx0, ty0, tx1, ty1 = table_bbox
+    return bx0 < tx1 and bx1 > tx0 and by0 < ty1 and by1 > ty0
+
+
 def extract_pdf(
     data: bytes, chunk_size: int = 800, chunk_overlap: int = 120
 ) -> list[ExtractedChunk]:
@@ -180,13 +186,20 @@ def extract_pdf(
     chunks: list[ExtractedChunk] = []
     for page_number, page in enumerate(document, start=1):
         location = {"type": "page", "start": page_number, "end": page_number}
-        text = page.get_text("text").strip()
-        if text:
-            chunks.extend(_split_prose(text, location, chunk_size, chunk_overlap))
         try:
             tables = page.find_tables().tables
         except Exception:
             tables = []
+        table_bboxes = [tuple(table.bbox) for table in tables]
+        # Drop text blocks that fall inside a detected table's bounding box so
+        # table cells aren't emitted both as prose and as a table chunk.
+        text = "\n".join(
+            block[4].strip()
+            for block in page.get_text("blocks")
+            if not any(_overlaps(tuple(block[:4]), bbox) for bbox in table_bboxes)
+        ).strip()
+        if text:
+            chunks.extend(_split_prose(text, location, chunk_size, chunk_overlap))
         for table_number, table in enumerate(tables, start=1):
             table_location = {
                 **location,

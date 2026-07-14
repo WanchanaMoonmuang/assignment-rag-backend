@@ -136,3 +136,79 @@ server and worker processes for this round were killed after use.
 
 `uv run ruff check .` — all checks passed. `uv run pytest` — 62 passed (unchanged from
 Phase 3; no test code needed to change for this round's findings).
+
+## 2026-07-14 — Bug-fix batch verification: calculator scope, PDF table dedup, tool_activity persistence (branch: fix/bug-batch-backend, commit: 9b90ab5 + uncommitted working tree)
+
+Environment: live services (MongoDB Atlas, Vertex AI `gemini-3.5-flash`, GCS), API on
+`:8080` + worker as two foreground processes, plus unit-only static checks. Checks: `uv run
+ruff check .` — all checks passed (0 issues). `uv run pytest` — 64 passed, 0 failed
+(baseline 60; +2 new regression tests in this diff, +2 pre-existing from prior rounds).
+`uv run python -m app.check_config` — `Backend config ok` (used corrected
+`GOOGLE_APPLICATION_CREDENTIALS=/home/developer/.config/gcloud/gcp_key.json`, per the known
+local env quirk — not a code issue).
+
+Diff under test: `app/extraction.py`, `app/main.py`, `app/rag.py`, `tests/test_app.py`,
+`tests/test_extraction.py` (uncommitted, working tree only).
+
+### Test cases
+
+| ID | Scenario | Steps / request | Expected | Actual | Status |
+| --- | --- | --- | --- | --- | --- |
+| BQA-030 | B1: conceptual question does not trigger calculator (non-stream) | `POST /api/chat {"question":"What is a RAG pipeline?","top_k":0}` | 200, answer, `tool_activity: []` | 200, correct conceptual answer, `tool_activity: []` | PASS |
+| BQA-031 | B1: conceptual question does not trigger calculator (SSE) | `POST /api/chat/stream {"question":"What is retrieval augmented generation used for?"}` | no `tool_call`/`tool_result` events | 0 tool events in the SSE stream; answer streamed and completed normally | PASS |
+| BQA-032 | B1: explicit arithmetic still triggers calculator (non-stream) | `POST /api/chat {"question":"what is 47 * 6?","top_k":0}` | 200, answer "282", `tool_activity` populated | answer `"47 * 6 is 282."`, `tool_activity: [{name: calculator, arguments: {expression: "47 * 6"}, result: 282}]` | PASS |
+| BQA-033 | B3: tool call available at `top_k=0`, non-streaming | same as BQA-032 (top_k explicitly 0) | tool still resolves despite retrieval disabled | confirmed — no gate on tool availability tied to `top_k` | PASS |
+| BQA-034 | B3: tool call available at `top_k=0`, streaming | `POST /api/chat/stream {"question":"what is 12 * 9?","top_k":0}` | `tool_call` → `tool_result` → token(s) → `done`, correct result | SSE showed exactly that sequence, `tool_result` `display_value: "108"`, final answer `"12 * 9 is 108."` | PASS |
+| BQA-035 | B6: persisted `tool_activity` never contains a dangling "requested" entry (live) | Same request as BQA-034, then `GET /api/conversations/{id}` | persisted assistant message's `tool_activity` has exactly one entry, `status: "completed"`, with `name`/`arguments`/`display_value` | confirmed: one entry, `{"name":"calculator","arguments":{"expression":"12 * 9"},"status":"completed","display_value":"108"}` — no `"requested"` entry present | PASS |
+| BQA-036 | B6 unit regression exercises the real persistence branch | `tests/test_app.py::test_stream_chat_persists_only_resolved_tool_activity` | asserts `app/main.py`'s `stream_chat` only appends `tool_result` events to `tool_activity`, using a `FakeGemini` + real `TestClient` POST + inspecting the stored conversation doc (not the `GeminiClient` in isolation) | test does exercise the `app/main.py` persistence branch (posts through `/api/chat/stream`, reads back `app.state.db["conversations"]`), not just `stream_with_calculator` — genuine regression coverage | PASS |
+| BQA-037 | B6: non-streaming persisted shape (`{name, arguments, result}`, no `status`/`display_value`) still renders correctly on the frontend | Code review: `ChatWorkspace.tsx`'s `ToolActivityRow` — `pending = status === "requested"`, `failed = status === "failed" \|\| Boolean(error)`, `value = display_value ?? (typeof result is primitive ? String(result) : undefined)` | missing `status` on the non-stream shape must not be interpreted as "pending" or break rendering | confirmed self-consistent: with `status` absent, `pending` and `failed` both evaluate `false`, and `value` falls back to `result` — renders as a completed line, not stuck spinning. This behavior predates the current diff (non-stream path/shape untouched by it) and is not made worse or better by it | PASS (no regression) |
+| BQA-038 | B2/B5: PDF table-cell duplication regression test is a real assertion, not tautological | Reverted `app/extraction.py` only (`git stash push -- app/extraction.py`), reran `tests/test_extraction.py::test_pdf_extraction_does_not_duplicate_table_text_as_prose` | test fails pre-fix (proves the assertion is meaningful) | failed with `assert not True` (`first_row` from a table chunk found substring-inside a prose chunk) before the fix; passes after `git stash pop` restored the fix | PASS (test is a genuine regression guard) |
+| BQA-039 | B2/B5: no table-row duplication in prose chunks across the stress-test PDF | `extract_pdf(samples/sample-tables.pdf)` (11 pages, up to 4 tables/page, 29 table chunks total) — checked every table row (not just first row) against every prose chunk | zero substring matches of any table row (len ≥ 8) inside any prose chunk | 40 total chunks (29 table, 11 prose), 0 duplicate rows found | PASS |
+| BQA-040 | B2/B5: heuristic over-exclusion check (does dropping overlapping blocks lose legitimate nearby prose?) | For every page with tables, dumped every `page.get_text("blocks")` block classified as "excluded" (overlaps a table bbox) and inspected its text | excluded blocks should be genuine table cell content, not incidental prose/captions | manually inspected all excluded blocks across all 11 pages of `sample-tables.pdf` — every excluded block was table header/data-cell text; no prose paragraph or caption was misclassified as table content in this file | PASS (for this file; see note below on residual heuristic risk) |
+| BQA-041 | B4 (question, no fix) — confirm no code change and no regression | Diff review of `app/extraction.py`'s DOCX path | `extract` still routes `.docx` through `extract_markdown()`/MarkItDown, unchanged | confirmed no code change in this diff touches DOCX routing; matches the answer already given to the user (intentional, generic markdown path, name is just imprecise) | PASS (no-op, as expected) |
+| BQA-042 | Full regression sweep | `uv run ruff check .`, `uv run pytest` | 0 lint issues, all tests pass | 0 issues; 64 passed | PASS |
+| BQA-043 | `chat_metrics` content safety spot-check during this run's live calls | Grepped API stdout for `chat_metrics` events emitted by BQA-030/032/033/034 requests | latency/token/tool_names fields present, no chat text/document content/credentials | confirmed: fields present (`retrieval_ms`, `model_total_ms`, `input_tokens`/`output_tokens`, `tool_names`), no prohibited content in any event this run | PASS |
+| BQA-044 | B2/B5 collateral-change check: the prose-assembly mechanism itself switched from `page.get_text("text")` to a `page.get_text("blocks")` join **on every PDF page, including pages with zero tables** — this affects all PDF ingestion, not just table dedup. Verified it doesn't garble reading order or splice in non-text (e.g. image) block content on two table-free samples (`samples/MKT556._outline.pdf`, `samples/Content_Strategy_Plan_ODOT.pdf`) | For every page of both files: compared old `page.get_text("text")` output against the new `blocks`-join output (whitespace-normalized), and checked for any block with a non-zero block-type (image/non-text) | identical content and order between old and new extraction mechanisms; no non-text blocks present | exact match (whitespace-normalized) on every page of both files (2 pages + 7 pages); zero non-text blocks found in either file | PASS |
+
+### Bugs
+
+No new bugs found in this batch. All five acceptance criteria (B1, B2/B5, B3, B6; B4 is a
+question with no fix, confirmed as such) verified PASS, live where credentials allowed and
+by code review/unit test otherwise. No previously logged bug (BUG-B-001 through BUG-B-005)
+regressed — full pytest/ruff sweep and live calculator + observability spot-checks came back
+clean.
+
+### Note (not a bug — heuristic risk worth tracking)
+
+The PDF dedup fix in `app/extraction.py`'s `extract_pdf`/`_overlaps` excludes a text **block**
+(from `page.get_text("blocks")`) from the prose pass if it overlaps a detected table's bbox
+**at all** (any non-zero intersection), i.e. block-granularity, all-or-nothing, no partial-
+overlap threshold. On `samples/sample-tables.pdf` this was empirically safe — every excluded
+block was genuine table content, and zero row-level duplicates remained (BQA-039/040). Two
+theoretical edge cases were not reproducible with the available sample files and are worth a
+future stress test if a bug report ever surfaces on a different PDF layout:
+1. **Over-exclusion**: a caption or prose paragraph whose block happens to sit inside a
+   table's detected bbox (e.g. a slightly generous `find_tables()` bbox, or a caption
+   immediately above/below a table absorbed into the same visual block) would be dropped
+   entirely, silently losing that prose from retrieval.
+2. **Under-exclusion**: exclusion is block-granularity and all-or-nothing (any bbox
+   intersection drops the whole block) — the real gap is `find_tables()` itself
+   under-detecting a table's true rendered extent (e.g. rotated/merged cells, unusual
+   multi-column layouts). If the detected bbox doesn't cover the actual table area, the
+   corresponding text block(s) won't intersect it at all and won't be excluded, so their
+   content would still duplicate the table chunk — the fix's protection is only as good as
+   `find_tables()`'s own bbox accuracy.
+Neither was observed; flagging only because the acceptance criteria explicitly asked for
+this consideration and no PDF exercising these layouts was available in `samples/`. Also
+verified (BQA-044) that swapping `get_text("text")` for a `get_text("blocks")` join — which
+runs on every page, not only pages with tables — does not change extracted content or
+reading order on two table-free sample PDFs, and introduces no non-text block content.
+
+### Cleanup
+
+Live test conversations created during this round (BQA-030–034) were left in MongoDB
+Atlas (chat/document text is not persisted anywhere in this log, per the redaction rules);
+no test documents were ingested this round (no ingestion changes were in scope for this
+batch), so there was nothing to delete via `DELETE /api/documents/{id}`. API and worker
+foreground processes started for this round were killed after use; `/proc` scan confirmed
+no stray `uvicorn`/`app.worker` processes remained.
