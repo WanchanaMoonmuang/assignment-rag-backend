@@ -5,9 +5,11 @@ Last updated: 2026-07-14
 ## Current State
 
 Backend V2 is complete and validated against `docs/PRDv2.md` §11 acceptance criteria, live
-against real MongoDB Atlas, Vertex AI, and GCS. All prior blockers are resolved. **Next up:
-frontend V2** (per `PRDv2.md`) — the frontend currently remains on V1 behavior and this
-backend stays compatible with it (see V1-compat notes below).
+against real MongoDB Atlas, Vertex AI, and GCS — including a full-loop re-validation pass
+that live-tested multi-document comparison, idempotency/crash-recovery, and document
+deletion + GCS cleanup (previously only verified by code review). All prior blockers are
+resolved. **Next up: frontend V2** (per `PRDv2.md`) — the frontend currently remains on V1
+behavior and this backend stays compatible with it (see V1-compat notes below).
 
 Repository: `poc-rag-backend`
 
@@ -16,7 +18,7 @@ Current branch: `fix/backend-v2-completion` (based on `develop`, not yet merged/
 Current committed head:
 
 ```text
-b82dec2 Fix backend V2 runtime bugs found in full PRDv2 validation
+94e3688 Emit worker/API metrics to stdout explicitly and line-buffer
 ```
 
 `develop` (`bc8c198`) already contains the full V2 feature stack (PRs #4–#8: extraction,
@@ -66,6 +68,24 @@ Full repro steps, root causes, and re-verification evidence for all four are in
 `docs/QA.md` (BUG-B-001, BUG-B-003, BUG-B-004, BUG-B-005). `uv run ruff check .` passes;
 `uv run pytest` — 62 passed (up from 60 at last handoff; added/updated regression tests
 for each fix).
+
+A subsequent full-loop re-validation pass live-tested three items the first pass had only
+verified by code review: multi-document comparison (a comparison question with no
+document filter correctly cited two distinct documents), idempotency/crash-recovery
+(simulated a crashed worker via an expired lease; a fresh worker reclaimed and completed
+with no duplicate chunks), and the document deletion + GCS cleanup lifecycle end-to-end.
+Ingestion timeout handling is covered by the existing `test_worker_records_processing_timeout`
+regression test, which exercises the real `asyncio.wait_for` path in `process_job`.
+
+This pass also chased down and resolved a false alarm in the worker process's
+`worker_stage`/`worker_job` logging, which initially looked broken again after the first
+pass's fix. Root cause: ~40 leftover worker/API processes from earlier in the same long
+debugging session were still alive (invisible to `ps aux`, found via a `/proc` scan) and
+racing to claim jobs, so logging visibility depended on which stray process won each
+race — not a real defect. A small genuine improvement was kept (`app/observability.py`
+now binds its handler explicitly to `sys.stdout` with line-buffering, since the previous
+version relied on `StreamHandler()`'s default, which is `stderr`); no other code change
+was needed. Full detail in `docs/QA.md`'s "Observability re-investigation" section.
 
 ## Main Modules
 

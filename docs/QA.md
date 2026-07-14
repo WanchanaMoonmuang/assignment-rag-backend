@@ -76,3 +76,63 @@ All four bugs found in the 2026-07-13 validation run (BUG-B-001, BUG-B-003, BUG-
 - One non-reproducible observation during re-verification: a long-running worker process (several hours old, having processed dozens of jobs across this session) intermittently failed GCS downloads that succeeded instantly from a fresh process/script. Restarting the worker resolved it every time. Not one of the four tracked bugs — no code fix applied — noting it here in case it recurs in a real long-lived deployment; possibly sandboxed-environment GCS client degradation under heavy iteration, not confirmed to be a production concern.
 
 Test-case status updates from the prior run: BQA-003, BQA-004 no longer need the "with caveat" qualifier (race eliminated); BQA-006, BQA-017, BQA-018 flip from FAIL to PASS; BQA-020's emission caveat is resolved.
+
+## 2026-07-14 — Full-loop PRD re-validation (branch: fix/backend-v2-completion)
+
+Re-ran the full feature set against PRDv2 live (fresh MongoDB Atlas/Vertex AI/GCS, no
+mocks), specifically exercising several items the prior run had only verified by code
+review. Test IDs continue from BQA-024.
+
+| ID | Case | Steps | Expected | Actual | Result |
+|----|------|-------|----------|--------|--------|
+| BQA-025 | Multi-document comparison (live, not code review) | Ingested two short documents with distinct comparable facts (drone weight/price/flight-time), asked a comparison question via `/api/chat` with no `document_id` filter | answer compares both, citations reference both source documents (PRDv2 §11: "a comparison fixture retrieves relevant chunks from at least two documents ... without document selection") | answer correctly stated both drones' weight/price/flight-time with `[1]`/`[2]` citations mapping to the two distinct `document_id`s; no manual selection used | PASS |
+| BQA-026 | Idempotency / crash-recovery (live, not code review) | Queued a job, then directly set it to `status: processing`, `stage: chunking`, `attempts: 1`, an **expired** `lease_expires_at` (simulating a worker that claimed the job and crashed mid-processing) via a MongoDB write; started a fresh worker | fresh worker reclaims via the `processing` + expired-lease branch of `claim_job`'s filter, completes at `attempts: 2`, exactly one set of chunks (no duplicates from the "crashed" first attempt) | worker log showed `attempt=2`, full stage pipeline completed; chunk collection had exactly 1 chunk for that document | PASS |
+| BQA-027 | Ingestion timeout handling | Existing automated regression test `tests/test_app.py::test_worker_records_processing_timeout` — monkeypatches `process_text_job` to outlast `ingestion_processing_timeout_seconds`, asserts `error.code == "processing_timeout"` | timeout raises inside `process_job`'s `asyncio.wait_for`, routes through the same failure/retry path as other errors | test passes (part of the 62-test suite); exercises the real `process_job` code path, not just a read-through | PASS — upgraded from BQA-022's "code review only" |
+| BQA-028 | Document deletion + GCS cleanup lifecycle (live) | Ingested a document, then `DELETE /api/documents/{id}` | chunks deleted, document deleted, GCS original object deleted (`cleanup_completed`), re-downloading the object 404s | all confirmed: chunks gone, document gone, GCS object gone, cleanup job terminal at `cleanup_completed` | PASS |
+| BQA-029 | Reject oversized/malformed/mismatched ingestion payloads (live, not code review) | Oversized text, oversized file, fake-signature "PDF", malformed JSON, malformed CSV, unsupported `.exe` extension, each via the real endpoints | 413 for size, 415 for signature/format mismatches, clean `extraction_failed` (not a crash) for structurally-invalid-but-accepted formats like CSV | oversized text → 413; oversized file → 413; fake PDF signature → 415; malformed JSON → 415 at upload; malformed CSV → 202 at upload then a clean worker-stage `extraction_failed` ("CSV rows must match the header columns"); `.exe` → 415 | PASS — upgraded from BQA-023/BQA-024's "code review only" |
+
+### Observability re-investigation (BUG-B-001 correction)
+
+The 2026-07-13 fix for BUG-B-001 (missing `logging` handler in `app/observability.py`) was
+only cleanly re-verified live for the **API** process in that session; this round set out
+to confirm the **worker** process's `worker_stage`/`worker_job` events the same way, and
+initially could not reproduce reliable output — plain `uv run python -m app.worker` runs
+showed zero log lines even though jobs completed correctly every time, across roughly a
+dozen different hypotheses (stream target, line-buffering, `PYTHONUNBUFFERED`, a startup
+probe line, swallowed-exception checks).
+
+**Root cause, found via a `/proc` scan (not `ps aux`, which reported nothing running):**
+this long session had accumulated **~40 leftover `uv run python -m app.worker` and
+`uvicorn` processes** from earlier test rounds, all still alive and polling MongoDB. Job
+claims are atomic (`find_one_and_update`), so whichever stray instance won the race
+processed the job — not necessarily the one actually being tested — which explains the
+inconsistent, seemingly buffering-related symptoms across many "fixes." None of those
+fixes were the real cause. Killing every stray process and re-testing with exactly one
+worker instance showed the original fix works correctly and deterministically: every
+`worker_stage`/`worker_job` event for a real job appears in stdout, in order, every time.
+
+- **Genuine fix kept and committed** (commit `94e3688`): `app/observability.py` now
+  explicitly binds `logging.StreamHandler(stream=sys.stdout)` (the previous version used
+  the bare `StreamHandler()` default, which is `stderr`) and force-enables line-buffering
+  on `sys.stdout`. This is correct regardless of the process-leak issue above and is a
+  reasonable safeguard for Cloud Run's stdout-only capture.
+- **No code change was needed or made for the worker-specific "invisible logs" symptom**
+  — it was a test-environment artifact (leftover background processes from a long
+  session), not a defect in `app/worker.py` or `app/observability.py`. `docs/handoff.md`
+  and this file are corrected accordingly: BUG-B-001 is fixed for both API and worker
+  processes, confirmed live for both.
+- Practical takeaway for future long debugging sessions in this environment: `ps aux`
+  can fail to show processes started via `&`/`disown` in earlier shell invocations even
+  though they're still alive; scan `/proc/*/cmdline` directly and kill stragglers before
+  trusting a "flaky" result.
+
+### Cleanup
+
+All test/debug documents created during this round and the observability investigation
+(19 total, e.g. `zephyr-x200.txt`, `idempotency-test.txt`, various `*-probe.txt`/
+`*-test.txt` artifacts) were deleted via `DELETE /api/documents/{id}` after validation;
+`GET /api/documents` confirmed the collection is empty of test artifacts. All test API
+server and worker processes for this round were killed after use.
+
+`uv run ruff check .` — all checks passed. `uv run pytest` — 62 passed (unchanged from
+Phase 3; no test code needed to change for this round's findings).
