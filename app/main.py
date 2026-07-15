@@ -210,7 +210,7 @@ async def retrieve_chunks(
         return []
     if not settings.mongodb_vector_index:
         raise HTTPException(status_code=500, detail="MONGODB_VECTOR_INDEX is not configured")
-    [query_embedding] = await gemini.embed_texts([question])
+    [query_embedding] = await gemini.embed_texts([question], task_type="RETRIEVAL_QUERY")
     candidate_limit = max(top_k * 4, 20)
     pipeline = [
         {
