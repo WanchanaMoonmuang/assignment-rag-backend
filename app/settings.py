@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     gemini_model: str = "gemini-3.5-flash"
     gemini_embedding_model: str = "gemini-embedding-2"
     gemini_embedding_dimensions: int = 768
+    gemini_embed_requests_per_minute: int = Field(default=50, ge=1)
     google_cloud_project: str | None = None
     gcp_project_id: str | None = None
     google_cloud_location: str = "us-central1"
