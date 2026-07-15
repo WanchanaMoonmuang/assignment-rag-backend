@@ -5,10 +5,10 @@ Generation (RAG) chatbot: upload business documents, ask questions in a persiste
 chat, and get Gemini-generated answers grounded in citations back to the source
 material. Interactive API docs run at `/api/docs` once the server is running.
 
-This backend implements the **V2** contract in
-[`../docs/PRDv2.md`](../docs/PRDv2.md); see [`../docs/app-architecture.md`](../docs/app-architecture.md)
-for the cross-repo architecture note, and
-[`../docs/diagram-rag-data-flow.md`](../docs/diagram-rag-data-flow.md) for a visual
+This backend implements the contract in
+[`docs/PRD.md`](docs/PRD.md); see [`docs/app-architecture.md`](docs/app-architecture.md)
+for the architecture note, and
+[`docs/diagram-rag-data-flow.md`](docs/diagram-rag-data-flow.md) for a visual
 walkthrough of the pipeline described below.
 
 ## Contents
@@ -145,7 +145,7 @@ docs/
 ```bash
 uv sync --extra dev
 cp .env.example .env        # then fill in the real values below
-uv run uvicorn app.main:app --reload    # API on http://localhost:8080
+uv run uvicorn app.main:app --reload --port 8080    # API on http://localhost:8080
 uv run python -m app.worker              # ingestion worker, separate process
 ```
 
@@ -232,7 +232,7 @@ running. Summary:
 | `POST /api/ingestions/text` | start a text-ingestion job (`202`) |
 | `POST /api/ingestions/file` | start a multipart file-ingestion job (`202`) |
 | `GET /api/ingestions/{job_id}` | poll job status/stage/error |
-| `POST /api/ingest` | **deprecated** V1 shim; delegates to the V2 text-ingestion job |
+| `POST /api/ingest` | **deprecated** shim; delegates to the text-ingestion job |
 | `GET /api/documents` | list ingested documents |
 | `DELETE /api/documents/{document_id}` | delete a document, its chunks, and its GCS original |
 | `GET /api/documents/{document_id}/chunks/{chunk_id}` | fetch a cited chunk plus neighbors |
