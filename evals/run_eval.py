@@ -270,6 +270,16 @@ def write_report(
         "embedding_model": settings.gemini_embedding_model,
         "embedding_dimensions": settings.gemini_embedding_dimensions,
     }
+    retrieval = {
+        "rag_top_k": settings.rag_top_k,
+        "rag_chunk_size": settings.rag_chunk_size,
+        "rag_chunk_overlap": settings.rag_chunk_overlap,
+        "mongodb_vector_index": settings.mongodb_vector_index,
+        "mongodb_search_index": settings.mongodb_search_index,
+        # $rankFusion weights are hardcoded equal in app/main.py:retrieve_chunks, not a setting.
+        "rankfusion_weights": {"vector": 1, "lexical": 1},
+        "generation_context_token_budget": settings.generation_context_token_budget,
+    }
 
     # ragas' output columns are the dataset input columns plus one column per metric;
     # metric columns are whatever's left after the known input columns.
@@ -285,6 +295,7 @@ def write_report(
         json.dumps(
             {
                 "models": models,
+                "retrieval": retrieval,
                 "aggregates": aggregates,
                 "rows": [
                     {
@@ -307,6 +318,17 @@ def write_report(
     md_lines.append(f"- **Judge model**: {models['judge_model']}")
     md_lines.append(
         f"- **Embedding model**: {models['embedding_model']} ({models['embedding_dimensions']} dims)"
+    )
+    md_lines += ["", "## Retrieval config", ""]
+    md_lines.append(f"- **rag_top_k**: {retrieval['rag_top_k']}")
+    md_lines.append(
+        f"- **Chunking**: size={retrieval['rag_chunk_size']}, overlap={retrieval['rag_chunk_overlap']}"
+    )
+    md_lines.append(f"- **Vector index**: {retrieval['mongodb_vector_index']}")
+    md_lines.append(f"- **Search index**: {retrieval['mongodb_search_index']}")
+    md_lines.append(f"- **$rankFusion weights**: {retrieval['rankfusion_weights']}")
+    md_lines.append(
+        f"- **Generation context token budget**: {retrieval['generation_context_token_budget']}"
     )
     md_lines += ["", "## Aggregate scores", ""]
     for name, value in aggregates.items():
