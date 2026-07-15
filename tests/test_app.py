@@ -11,7 +11,14 @@ from fastapi.testclient import TestClient
 from pymongo.errors import OperationFailure
 
 from app.main import app, configure_gemini_client
-from app.rag import SYSTEM_INSTRUCTION, GeminiClient, build_prompt, chunk_text, provider_usage, question_fits_budget
+from app.rag import (
+    SYSTEM_INSTRUCTION,
+    GeminiClient,
+    build_prompt,
+    chunk_text,
+    provider_usage,
+    question_fits_budget,
+)
 from app.settings import Settings, get_settings
 from app.worker import claim_job, process_job
 
@@ -176,7 +183,28 @@ class FakeGemini:
         yield " answer."
 
 
+def _fake_embed_client(fake_models: Any) -> GeminiClient:
+    client = GeminiClient.__new__(GeminiClient)
+    client._settings = SimpleNamespace(
+        gemini_embedding_model="test",
+        gemini_embedding_dimensions=2,
+        # High enough that the rate-limit pacer never sleeps in tests.
+        gemini_embed_requests_per_minute=1_000_000,
+    )
+    client._client = SimpleNamespace(models=fake_models)
+    client._types = SimpleNamespace(
+        Content=lambda parts: parts,
+        Part=SimpleNamespace(from_text=lambda text: text),
+        EmbedContentConfig=lambda **kwargs: kwargs,
+    )
+    client._embed_rate_lock = asyncio.Lock()
+    client._last_embed_call_at = None
+    return client
+
+
 def test_embed_texts_submits_each_chunk_separately() -> None:
+    # Vertex AI's embedContent API rejects more than one content per call for
+    # this model, so each text must still be its own call.
     calls: list[list[object]] = []
 
     class FakeModels:
@@ -185,17 +213,62 @@ def test_embed_texts_submits_each_chunk_separately() -> None:
             index = len(calls)
             return SimpleNamespace(embeddings=[SimpleNamespace(values=[float(index)])])
 
-    client = GeminiClient.__new__(GeminiClient)
-    client._settings = SimpleNamespace(gemini_embedding_model="test", gemini_embedding_dimensions=2)
-    client._client = SimpleNamespace(models=FakeModels())
-    client._types = SimpleNamespace(
-        Content=lambda parts: parts,
-        Part=SimpleNamespace(from_text=lambda text: text),
-        EmbedContentConfig=lambda **kwargs: kwargs,
-    )
+    client = _fake_embed_client(FakeModels())
 
     assert asyncio.run(client.embed_texts(["first", "second"])) == [[1.0], [2.0]]
     assert calls == [[["first"]], [["second"]]]
+
+
+def test_embed_texts_throttles_to_configured_rate() -> None:
+    import time
+
+    class FakeModels:
+        def embed_content(self, **kwargs: Any) -> Any:
+            return SimpleNamespace(embeddings=[SimpleNamespace(values=[1.0])])
+
+    client = _fake_embed_client(FakeModels())
+    client._settings.gemini_embed_requests_per_minute = 600  # 0.1s minimum gap
+
+    start = time.monotonic()
+    asyncio.run(client.embed_texts(["a", "b", "c"]))
+    elapsed = time.monotonic() - start
+
+    assert elapsed >= 0.2  # two gaps of ~0.1s between three calls
+
+
+def test_embed_texts_retries_on_rate_limit_then_succeeds() -> None:
+    from google.genai import errors as genai_errors
+
+    attempts = {"count": 0}
+
+    class FakeModels:
+        def embed_content(self, **kwargs: Any) -> Any:
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise genai_errors.APIError(429, {"error": {"message": "rate limited"}})
+            return SimpleNamespace(embeddings=[SimpleNamespace(values=[1.0])])
+
+    client = _fake_embed_client(FakeModels())
+
+    assert asyncio.run(client.embed_texts(["only"])) == [[1.0]]
+    assert attempts["count"] == 2
+
+
+def test_embed_texts_does_not_retry_non_retryable_error() -> None:
+    from google.genai import errors as genai_errors
+
+    attempts = {"count": 0}
+
+    class FakeModels:
+        def embed_content(self, **kwargs: Any) -> Any:
+            attempts["count"] += 1
+            raise genai_errors.APIError(400, {"error": {"message": "bad request"}})
+
+    client = _fake_embed_client(FakeModels())
+
+    with pytest.raises(genai_errors.APIError):
+        asyncio.run(client.embed_texts(["only"]))
+    assert attempts["count"] == 1
 
 
 def test_embed_texts_forwards_task_type() -> None:
@@ -206,14 +279,7 @@ def test_embed_texts_forwards_task_type() -> None:
             configs.append(kwargs["config"])
             return SimpleNamespace(embeddings=[SimpleNamespace(values=[1.0])])
 
-    client = GeminiClient.__new__(GeminiClient)
-    client._settings = SimpleNamespace(gemini_embedding_model="test", gemini_embedding_dimensions=2)
-    client._client = SimpleNamespace(models=FakeModels())
-    client._types = SimpleNamespace(
-        Content=lambda parts: parts,
-        Part=SimpleNamespace(from_text=lambda text: text),
-        EmbedContentConfig=lambda **kwargs: kwargs,
-    )
+    client = _fake_embed_client(FakeModels())
 
     # Default is the document task type; the query path overrides it.
     asyncio.run(client.embed_texts(["doc"]))
@@ -319,7 +385,9 @@ def test_gemini_vertex_ai_uses_project_location_and_model_api(monkeypatch: pytes
     class Models:
         def embed_content(self, **kwargs: Any) -> Any:
             embed_calls.append(kwargs)
-            return SimpleNamespace(embeddings=[SimpleNamespace(values=[0.1])])
+            return SimpleNamespace(
+                embeddings=[SimpleNamespace(values=[0.1]) for _ in kwargs["contents"]]
+            )
 
         def generate_content(self, **kwargs: Any) -> Any:
             generate_calls.append(kwargs)
@@ -342,10 +410,15 @@ def test_gemini_vertex_ai_uses_project_location_and_model_api(monkeypatch: pytes
             google_cloud_project="project-1",
             google_cloud_location="asia-southeast1",
             gemini_temperature=0.63,
+            gemini_embed_requests_per_minute=1_000_000,
         )
     )
     assert asyncio.run(client.embed_texts(["first", "second"])) == [[0.1], [0.1]]
-    assert [[content.parts for content in call["contents"]] for call in embed_calls] == [[["first"]], [["second"]]]
+    # Vertex AI's embedContent API only accepts one content per call.
+    assert [[content.parts for content in call["contents"]] for call in embed_calls] == [
+        [["first"]],
+        [["second"]],
+    ]
     assert asyncio.run(client.generate("prompt")) == "generated"
 
     async def collect_stream() -> list[str]:
