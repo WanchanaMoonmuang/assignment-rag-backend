@@ -5,11 +5,21 @@ import json
 from contextvars import ContextVar
 from typing import Any, AsyncIterator
 from uuid import uuid4
+
+from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt, wait_exponential
+
 from app.calculator import CalculatorError, calculate
 
 from app.settings import Settings
 
 FALLBACK_ANSWER = "I could not generate an answer. Please try again."
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+
+def _is_retryable_gemini_error(exc: BaseException) -> bool:
+    from google.genai import errors as genai_errors
+
+    return isinstance(exc, genai_errors.APIError) and exc.code in _RETRYABLE_STATUS_CODES
 SYSTEM_INSTRUCTION = (
     "Answer in the language of the user's latest question. "
     "When document context is provided, support document-based claims with inline markers "
@@ -166,6 +176,8 @@ class GeminiClient:
             raise RuntimeError("GEMINI_PROVIDER must be developer_api or vertex_ai")
         self._types = types
         self._last_usage: ContextVar[dict[str, int] | None] = ContextVar("last_usage", default=None)
+        self._embed_rate_lock = asyncio.Lock()
+        self._last_embed_call_at: float | None = None
 
     def _usage_context(self) -> ContextVar[dict[str, int] | None]:
         context = getattr(self, "_last_usage", None)
@@ -178,6 +190,41 @@ class GeminiClient:
     def last_usage(self) -> dict[str, int] | None:
         return self._usage_context().get()
 
+    async def _throttle_embed_rate(self) -> None:
+        # Vertex AI's embed_content quota is per-minute, not a transient burst
+        # limit — pacing calls up front avoids exhausting it, since retrying
+        # after a 429 can't outlast a quota window that's genuinely used up.
+        min_interval = 60.0 / self._settings.gemini_embed_requests_per_minute
+        async with self._embed_rate_lock:
+            loop = asyncio.get_event_loop()
+            now = loop.time()
+            if self._last_embed_call_at is not None:
+                wait = min_interval - (now - self._last_embed_call_at)
+                if wait > 0:
+                    await asyncio.sleep(wait)
+            self._last_embed_call_at = loop.time()
+
+    async def _embed_one_with_retry(self, content: Any, task_type: str) -> Any:
+        # Vertex AI's embedContent API rejects more than one content per call for
+        # this model ("only supports one content at a time"), so calls stay 1:1
+        # with texts; only transient errors are retried, one call at a time.
+        async for attempt in AsyncRetrying(
+            retry=retry_if_exception(_is_retryable_gemini_error),
+            stop=stop_after_attempt(5),
+            wait=wait_exponential(multiplier=1, min=1, max=20),
+            reraise=True,
+        ):
+            with attempt:
+                return await asyncio.to_thread(
+                    self._client.models.embed_content,
+                    model=self._settings.gemini_embedding_model,
+                    contents=[content],
+                    config=self._types.EmbedContentConfig(
+                        output_dimensionality=self._settings.gemini_embedding_dimensions,
+                        task_type=task_type,
+                    ),
+                )
+
     async def embed_texts(
         self, texts: list[str], task_type: str = "RETRIEVAL_DOCUMENT"
     ) -> list[list[float]]:
@@ -186,15 +233,8 @@ class GeminiClient:
         embeddings: list[list[float]] = []
         for text in texts:
             content = self._types.Content(parts=[self._types.Part.from_text(text=text)])
-            result = await asyncio.to_thread(
-                self._client.models.embed_content,
-                model=self._settings.gemini_embedding_model,
-                contents=[content],
-                config=self._types.EmbedContentConfig(
-                    output_dimensionality=self._settings.gemini_embedding_dimensions,
-                    task_type=task_type,
-                ),
-            )
+            await self._throttle_embed_rate()
+            result = await self._embed_one_with_retry(content, task_type)
             embeddings.extend(
                 [float(value) for value in embedding.values] for embedding in result.embeddings
             )

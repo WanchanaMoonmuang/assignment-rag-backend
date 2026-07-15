@@ -13,6 +13,7 @@ dependencies = [
     "pyjwt>=2.9.0",
     "pymupdf>=1.28.0",
     "python-multipart>=0.0.32",
+    "tenacity>=9.0.0",
     "uvicorn[standard]>=0.30.0",
 ]
 
