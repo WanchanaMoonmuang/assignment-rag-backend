@@ -183,6 +183,32 @@ async def set_stage(db: Any, settings: Settings, job: dict[str, Any], stage: str
     job["_metric_stage_started"] = perf_counter()
 
 
+def build_chunk_documents(
+    job: dict[str, Any],
+    chunks: list[ExtractedChunk],
+    embeddings: list[list[float]],
+    document: dict[str, Any],
+    created_at: datetime,
+) -> list[dict[str, Any]]:
+    metadata = document.get("metadata") or {}
+    return [
+        {
+            "_id": make_id("chunk"),
+            "document_id": job["document_id"],
+            "document_name": job["document_name"],
+            "chunk_index": index,
+            "content": chunk.content,
+            "embedding": embedding,
+            "metadata": metadata,
+            "source_format": document["source_format"],
+            "chunk_type": chunk.chunk_type,
+            "location": chunk.location,
+            "created_at": created_at,
+        }
+        for index, (chunk, embedding) in enumerate(zip(chunks, embeddings), start=1)
+    ]
+
+
 async def publish_job(
     db: Any,
     settings: Settings,
@@ -212,22 +238,7 @@ async def publish_job(
             "updated_at": created_at,
         }
     )
-    chunk_documents = [
-        {
-            "_id": make_id("chunk"),
-            "document_id": document_id,
-            "document_name": job["document_name"],
-            "chunk_index": index,
-            "content": chunk.content,
-            "embedding": embedding,
-            "metadata": metadata,
-            "source_format": document["source_format"],
-            "chunk_type": chunk.chunk_type,
-            "location": chunk.location,
-            "created_at": created_at,
-        }
-        for index, (chunk, embedding) in enumerate(zip(chunks, embeddings), start=1)
-    ]
+    chunk_documents = build_chunk_documents(job, chunks, embeddings, document, created_at)
 
     await set_stage(db, settings, job, "finalizing")
     jobs = db[settings.mongodb_ingestion_job_collection]

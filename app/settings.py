@@ -17,10 +17,12 @@ class Settings(BaseSettings):
     mongodb_ingestion_job_collection: str = "ingestion_jobs"
     mongodb_vector_index: str | None = None
     mongodb_search_index: str = "document_chunks_text_index"
-    gemini_model: str = "gemini-3.5-flash"
+    gemini_model: str = "gemini-2.5-flash"
     gemini_embedding_model: str = "gemini-embedding-2"
     gemini_embedding_dimensions: int = 768
     gemini_embed_requests_per_minute: int = Field(default=50, ge=1)
+    eval_judge_model: str = "gemini-3.5-flash"
+    eval_ragas_max_workers: int = Field(default=2, ge=1)
     google_cloud_project: str | None = None
     gcp_project_id: str | None = None
     google_cloud_location: str = "us-central1"
