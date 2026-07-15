@@ -194,7 +194,9 @@ async def publish_job(
     if not chunks:
         raise ExtractionError("Document does not contain extractable text")
     await set_stage(db, settings, job, "embedding")
-    embeddings = await gemini.embed_texts([chunk.content for chunk in chunks])
+    embeddings = await gemini.embed_texts(
+        [chunk.content for chunk in chunks], task_type="RETRIEVAL_DOCUMENT"
+    )
     if len(embeddings) != len(chunks):
         raise RuntimeError("Embedding count did not match chunk count")
 

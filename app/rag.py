@@ -178,7 +178,9 @@ class GeminiClient:
     def last_usage(self) -> dict[str, int] | None:
         return self._usage_context().get()
 
-    async def embed_texts(self, texts: list[str]) -> list[list[float]]:
+    async def embed_texts(
+        self, texts: list[str], task_type: str = "RETRIEVAL_DOCUMENT"
+    ) -> list[list[float]]:
         if not texts:
             return []
         embeddings: list[list[float]] = []
@@ -189,7 +191,8 @@ class GeminiClient:
                 model=self._settings.gemini_embedding_model,
                 contents=[content],
                 config=self._types.EmbedContentConfig(
-                    output_dimensionality=self._settings.gemini_embedding_dimensions
+                    output_dimensionality=self._settings.gemini_embedding_dimensions,
+                    task_type=task_type,
                 ),
             )
             embeddings.extend(
