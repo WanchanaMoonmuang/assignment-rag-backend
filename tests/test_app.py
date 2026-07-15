@@ -20,7 +20,7 @@ from app.rag import (
     question_fits_budget,
 )
 from app.settings import Settings, get_settings
-from app.worker import claim_job, process_job
+from app.worker import build_chunk_documents, claim_job, process_job
 
 
 class Cursor:
@@ -1187,6 +1187,35 @@ def test_file_worker_downloads_extracts_and_publishes_metadata(
     assert chunk["location"]["label"] == "Lines 1-2"
     assert chunk["chunk_type"] == "prose"
 
+
+
+def test_build_chunk_documents_shape() -> None:
+    from app.extraction import ExtractedChunk
+
+    job = {"document_id": "doc_1", "document_name": "policy.txt"}
+    chunks = [
+        ExtractedChunk("First.", "prose", {"type": "line", "start": 1, "end": 1, "label": "Lines 1-1"}),
+        ExtractedChunk("Second.", "prose", {"type": "line", "start": 2, "end": 2, "label": "Lines 2-2"}),
+    ]
+    embeddings = [[0.1, 0.2], [0.3, 0.4]]
+    document = {"source_format": "txt", "metadata": {"department": "support"}}
+    created_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    chunk_documents = build_chunk_documents(job, chunks, embeddings, document, created_at)
+
+    assert len(chunk_documents) == 2
+    first = chunk_documents[0]
+    assert first["document_id"] == "doc_1"
+    assert first["document_name"] == "policy.txt"
+    assert first["chunk_index"] == 1
+    assert first["content"] == "First."
+    assert first["embedding"] == [0.1, 0.2]
+    assert first["metadata"] == {"department": "support"}
+    assert first["source_format"] == "txt"
+    assert first["chunk_type"] == "prose"
+    assert first["location"]["label"] == "Lines 1-1"
+    assert first["created_at"] == created_at
+    assert chunk_documents[1]["chunk_index"] == 2
 
 
 def test_expired_final_file_job_schedules_cleanup(client: TestClient) -> None:

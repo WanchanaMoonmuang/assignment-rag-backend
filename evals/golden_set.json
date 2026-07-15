@@ -1,0 +1,134 @@
+{
+  "carsbrand.json": [
+    {
+      "question": "Among cars manufactured between 1977 and 1982, rank the origins by average Miles_per_Gallon. Ignore missing MPG values. Also report the number of cars used and average weight.",
+      "ground_truth": "1. Europe: Avg MPG 32.96, Cars 8, Avg Weight 2376.11 lbs. 2. Japan: Avg MPG 32.23, Cars 18, Avg Weight 2216.39 lbs. 3. USA: Avg MPG 23.10, Cars 42, Avg Weight 3150.74 lbs."
+    },
+    {
+      "question": "Find all cars satisfying Horsepower ≥ 100, Weight < 3000 lbs, MPG ≥ 20, Year ≥ 1977. Rank them by Horsepower / Weight (descending).",
+      "ground_truth": "Top 5: 1. oldsmobile omega brougham (0.042593), 2. bmw 320i(0.042308), 3. mazda rx-4 (0.040441), 4. ford granada l (0.039506), 5. datsun 200sx (0.038241). Winner: oldsmobile omega brougham."
+    },
+    {
+      "question": "Compare model years 1970, 1977, 1978, and 1982. Compute average MPG, horsepower, displacement, and weight. Based on these values, explain the trend.",
+      "ground_truth": "1970: MPG 15.60, HP 170.46, Disp 352.54, Weight 3851.00. 1977: MPG 22.28, HP 109.44, Disp 202.84, Weight 3116.04. 1978: MPG 25.00, HP 92.67, Disp 192.44, Weight 2933.61. 1982: MPG 32.52, HP 77.83, Disp 117.52, Weight 2408.20. Conclusion: Fuel economy improved substantially over time while engines became smaller, horsepower declined, and vehicles became lighter."
+    },
+    {
+      "question": "Among Japanese cars, identify the five highest MPG vehicles. Then compute their average horsepower, average weight, and average acceleration. Compare these averages with those of all Japanese cars.",
+      "ground_truth": "Top 5: 1. datsun b210 gx (39.4 MPG), 2. toyota tercel (37.7), 3. datsun 210 (37.0), 4. honda civic cvcc (36.1), 5. honda civic 1300 (35.1). Top-5 averages: HP 63.40, Weight 1931.00 lbs, Acceleration 17.56 s. All Japanese cars: HP 74.61, Weight 2216.39 lbs, Acceleration 16.59 s. Interpretation:The most fuel-efficient Japanese cars are lighter and less powerful, with slightly slower acceleration."
+    },
+    {
+      "question": "Does the dataset provide enough information to determine whether vehicle weight has a stronger relationship with MPG than horsepower does?",
+      "ground_truth": "Correct answer: No, not from retrieval alone. Determining this requires computing statistical correlations (e.g., Pearson correlation) over the dataset after excluding missing values. A retrieval-only RAG should state that additional computation is required rather than inventing an answer."
+    }
+  ],
+  "Content_Strategy_Plan_ODOT.pdf": [
+    {
+      "question": "What are the four core content strategies in the ODOT Web Governance Plan, and what is the primary objective of each?",
+      "ground_truth": "Audience First: Design content around user needs and intended audiences. Task Oriented: Organize the website around customer tasks instead of the agency's organizational structure. Quality over Quantity:Publish only content that is current, relevant, and easily consumable while removing outdated or unnecessary content. Consistent Brand: Maintain consistent branding, design, voice, and user experience across the website while allowing limited division identity."
+    },
+    {
+      "question": "Who is responsible for governing and maintaining the ODOT website, and what are the responsibilities of each group?",
+      "ground_truth": "Web Governance Board: Makes governance decisions, oversees the governance plan, approves structural changes, grants exceptions, and enforces compliance. Director's Office Communications Section: Leads website support and partners with Enterprise Technology. Enterprise Technology Section: Provides technical services. Web Team: Creates and maintains website content according to the governance plan. All Employees: Suggest improvements, report outdated content, and may submit editorial calendar ideas."
+    },
+    {
+      "question": "According to the governance plan, what characteristics define high-quality web content, and what processes or tools are used to maintain content quality over time?",
+      "ground_truth": "Content characteristics: Current, easily consumable, relevant, accurate, accessible, useful, easy to find, and written in plain language. Maintenance mechanisms: Content lifecycle process, annual or division-specific reviews, SharePoint functionality, Siteimprove quality assurance, web analytics, content audits, usability testing, customer feedback, governance procedures, and retention schedules."
+    },
+    {
+      "question": "How does ODOT measure the success of its web governance strategy? List every success metric described in the document.",
+      "ground_truth": "The governance plan identifies six success metrics: (1) Monthly Web analytics reports, (2) Monthly quality assurance reports, (3) Annual rolling content audits, (4) Biennial usability testing, (5) Ongoing simple customer surveys, and (6) Periodic in-depth customer surveys."
+    },
+    {
+      "question": "A division wants to create a new webpage using its own navigation labels, a structure based on its internal organization chart, custom templates with fewer requirements than agency templates, and copyrighted images from the internet. Based on the governance plan, identify every policy violation and explain the correct approach.",
+      "ground_truth": "Violations: (1) Navigation should follow agency-level standards. (2) Information architecture should be organized around customer tasks, not the agency organization chart. (3) Division-specific templates may add requirements but cannot remove agency requirements. (4) Copyrighted images cannot be used without permission; ODOT resources should be used whenever possible. (5) Pages must follow agency branding, formatting, and style standards. (6) Structural changes to navigation or information architecture must be submitted to the Web Governance Board for review and approval."
+    }
+  ],
+  "Flashlearn.docx": [
+    {
+      "question": "Describe the complete user journey for \"The Infinite Learning Feed\" from opening the app until continuing to the next card. Include every major interaction in order.",
+      "ground_truth": "1. User opens the app to the Discovery Feed. 2. Selects a followed Topic and enters the Topic Hub. 3. Scrolls into the Study Feed containing an infinite vertical feed of randomized Cards. 4. Selects an answer choice. 5. Immediate feedback is shown (Success Green or Error Red), and the card expands to reveal the Ground Truth. 6.User upvotes or downvotes the card quality using left-aligned arrows. 7. Opens the Discussion Overlay/Page via the comment icon without losing scroll position. 8. Closes the discussion and continues scrolling to the next card. No progress bar is used; learning is continuous."
+    },
+    {
+      "question": "According to the Technical Architecture & Performance Matrix, which components are handled by the Frontend, Backend, or Hybrid, and what is the rationale for each architectural decision?",
+      "ground_truth": "Backend: Topic Screening (security and duplicate prevention), Card Shuffle & Batching (efficient randomized batches of 10–20 cards). Frontend: Poll interaction (instant green/red feedback), Single-Layer Lineage rendering (compute indentation from flat list), Mention autocomplete (debounced cached search). Hybrid: Vote tallying and caching (Frontend updates immediately; Backend asynchronously updates the database and cache)."
+    },
+    {
+      "question": "Explain how FlashLearn implements community discussion and notifications. Include comment nesting, mentions, notifications, deep-link behavior, and visual highlighting.",
+      "ground_truth": "Comments are displayed in a hybrid layout with the original card pinned at the top. Only one level of nested replies is allowed. A 2px #E2E8F0 lineage line connects parent and child comments. Typing @ triggers autocomplete, and published mentions appear in Primary Blue (#2563EB). Mentions and replies create notifications shown as a red dot (#EF4444). Opening a notification deep-links to the relevant thread and temporarily highlights the target comment with a 5% Cyan (#06B6D4) background."
+    },
+    {
+      "question": "A user creates a new Topic, then publishes a Card, and another user studies it, votes on it, comments, and mentions another user. Which database tables are involved, and what role does each table play?",
+      "ground_truth": "TOPIC: Stores the requested topic (pending → approved/rejected). CARD: Stores the question and Ground Truth. CHOICE: Stores answer options and identifies the correct answer. USER_ANSWER: Records the learner's selected answer. VOTE: Stores upvote/downvote for the card. COMMENT: Stores discussion comments and single-level replies. MENTION: Records tagged users inside comments. NOTIFICATION:Delivers mention or reply notifications. TOPIC_FOLLOW may also be involved if the studying user follows the topic."
+    },
+    {
+      "question": "A Premium (FlashExam) session should simulate a real examination. Based on the SRS, describe every functional and UI difference between the normal Study Feed and FlashExam mode.",
+      "ground_truth": "Normal Study Feed: Infinite randomized feed, instant answer feedback, Ground Truth revealed after answering, community voting, comments/discussion, social interactions enabled, Reset & Replay available after all cards are seen. FlashExam: Entered via the FlashExam navigation icon, transitions to a Dark Anchor (#1E3A8A) premium interface, uses Expert-Verified exams, and disables social features such as comments and grading to simulate a distraction-free testing environment."
+    }
+  ],
+  "MKT556._outline.pdf": [
+    {
+      "question": "What is the primary objective of the MKT556 Content Marketing course, and what practical skills are students expected to develop by the end of the course?",
+      "ground_truth": "The course aims to provide students with knowledge of content marketing strategies as a key part of digital marketing. Students learn audience analysis, content development and curation, scheduling, publishing, and the use of online content marketing tools. By the end of the course, they should be able to strategically use content to engage customers and stakeholders as part of a digital marketing campaign."
+    },
+    {
+      "question": "List all six topics covered in MKT556 in the order they appear in the course outline.",
+      "ground_truth": "1. Components of Content Marketing 2. Developing Content Marketing Strategy 3. Matching Personas to Hero Journey: Case Studies 4. Implementing Content Marketing Plan 5. Managing the Content Marketing Process 6. Applying Content Marketing on Online System"
+    },
+    {
+      "question": "Which learning outcomes focus specifically on planning and execution rather than evaluation? Identify those outcomes and explain why they belong to this category.",
+      "ground_truth": "Planning and execution outcomes include: (1) Propose how to curate and develop effective content for customer engagement. (2) Construct content marketing goals aligned to digital marketing campaigns. (3) Create a viable content distribution plan. (4) Set up content marketing plans in existing content management suites and online tools. These emphasize designing, creating, implementing, and configuring marketing activities rather than assessing existing strategies."
+    },
+    {
+      "question": "How is the assessment structured for MKT556? Calculate the total percentage allocated to Continuous Assessment and identify every assessment component with its weight.",
+      "ground_truth": "Continuous Assessment = 50%, consisting of: Group Based Assignment – 25%, Pre-Course Quiz – 10%, Participation – 15%. Examinable Component (ECA) = 50%. Total = 100%."
+    },
+    {
+      "question": "A student wants to maximize success in this course. Based on the course synopsis, learning outcomes, topics, and assessment scheme, what knowledge, skills, and preparation should the student prioritize?",
+      "ground_truth": "The student should: (1) Understand content marketing strategy and its role in digital marketing. (2) Master audience analysis, content creation, curation, scheduling, and publishing. (3) Learn to develop content marketing plans and distribution strategies. (4)Become familiar with content management suites and online content marketing tools (a laptop is expected for the seminar). (5) Develop communication and teamwork skills to perform well in group assignments and participation. Since Continuous Assessment (50%) includes assignments and participation, active engagement throughout the course is important in addition to preparing for the 50% ECA."
+    }
+  ],
+  "uk_ds_masters - ชีต1.csv": [
+    {
+      "question": "Rank all universities by QS World University Ranking (best to worst). For each university, include its course(s).",
+      "ground_truth": "1. Oxford (QS 4) – MSc Social Data Science. 2. Imperial College London (QS 6) – MSc Statistics Data Science. 3. UCL (QS 8) – MSc Machine Learning. 4. Edinburgh (QS 15) – MSc Data Science. 5. King's College London (QS 37) – MSc Data Science, MSc Artificial Intelligence. 6. Warwick (QS 64) – MSc Behavioural and Data Science."
+    },
+    {
+      "question": "Which university offers the most expensive program? Report the tuition fee in GBP and THB, and calculate how much more expensive it is than the cheapest program.",
+      "ground_truth": "Most expensive: Edinburgh – MSc Data Science (£38,500 / 1,561,945 THB). Cheapest: Warwick – MSc Behavioural and Data Science (£27,000 / 1,095,390 THB). Difference: £11,500 (466,555 THB)."
+    },
+    {
+      "question": "Which programs have an application deadline on or before 31 March 2023? Sort them by deadline, then by QS ranking if deadlines are the same.",
+      "ground_truth": "1. King's College London – MSc Data Science – 6 Mar 2023 (QS 37). 2. King's College London – MSc Artificial Intelligence – 6 Mar 2023 (QS 37). 3. UCL – MSc Machine Learning – 31 Mar 2023 (QS 8). 4. Edinburgh – MSc Data Science – 31 Mar 2023 (QS 15)."
+    },
+    {
+      "question": "Compare the universities marked as \"เรียนหนัก\" (intensive study). Which programs are they, what are their QS rankings, tuition fees, and reference counts?",
+      "ground_truth": "Two programs are marked \"เรียนหนัก\": Oxford – MSc Social Data Science(QS 4, £30,910, 3 references) and Imperial College London – MSc Statistics Data Science (QS 6, £32,400, 2 references)."
+    },
+    {
+      "question": "A student wants a university ranked within the global Top 10, with tuition under £33,000 and at least 2 references. Which programs satisfy all criteria?",
+      "ground_truth": "Qualified programs: Oxford – MSc Social Data Science (QS 4, £30,910, 3 references) and Imperial College London – MSc Statistics Data Science(QS 6, £32,400, 2 references). UCL is Top 10 and has 2 references, but its tuition (£35,000) exceeds the £33,000 limit."
+    }
+  ],
+  "sample-tables.pdf": [
+    {
+      "question": "Using Table 24 (Year-end financial statement), calculate the total assets (Non-current assets + Current assets) and the total liabilities for each year (2010, 2009, and 2008). Then compute the net assets (Assets − Liabilities).",
+      "ground_truth": "2010: Non-current assets = 1,335, Current assets = 1,182, Total assets = 2,517, Liabilities = 496, Net assets = 2,021. 2009: Non-current assets = 1,222, Current assets = 968, Total assets = 2,190, Liabilities = 911, Net assets = 1,279. 2008: Non-current assets = 1,098, Current assets = 967, Total assets = 2,065, Liabilities = 1,340, Net assets = 725."
+    },
+    {
+      "question": "Based on Table 29 (Rainfall), identify the continent with the highest \"Highest average\" rainfall for each year (2010, 2009, and 2008). Did the leading continent change across the three years?",
+      "ground_truth": "2010: South America (523.6). 2009: South America (487.7). 2008: Africa (502.1). Yes. South America led in 2009 and 2010, while Africa led in 2008."
+    },
+    {
+      "question": "Using Table 16 (Masters courses offered by Institution X), which subjects offered a Master's degree continuously from 2006 through 2009? Which subjects never offered a Master's degree during this period?",
+      "ground_truth": "Continuously offered Master's: English (Yes in 2006–2009). Never offered Master's: International Relations, Philosophy, and Politics (No in every year). Economics offered a Master's only from 2007–2009, while Mathematics offered it only in 2006."
+    },
+    {
+      "question": "According to Table 20 (Expenditure by function), which expenditure category experienced the largest increase and which experienced the largest decrease between 2009/10 and 2010/11? Include the numerical change.",
+      "ground_truth": "Largest increase: Banking, from 22.90 to 44.23, an increase of 21.33. Largest decrease: Agency services, from 44.70 to 35.91, a decrease of 8.79."
+    },
+    {
+      "question": "Using Table 19 (Human Development Index trends), which country experienced the greatest improvement between 1980 and 2010 among countries with values available in both years? Calculate the improvement for each eligible country and identify the largest.",
+      "ground_truth": "Improvements (2010 − 1980): Afghanistan: +2.55 (3.33 − 0.78); Albania: +1.49 (10.38 − 8.89); Algeria: +2.50 (7.24 − 4.74); Andorra: +5.37 (10.35 − 4.98). Angola is excluded because 1980 data is missing. Largest improvement: Andorra (+5.37)."
+    }
+  ]
+}
