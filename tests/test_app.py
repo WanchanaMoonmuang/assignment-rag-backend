@@ -161,7 +161,9 @@ class FakeGemini:
         self.generate_prompts: list[str] = []
         self.stream_prompts: list[str] = []
 
-    async def embed_texts(self, texts: list[str]) -> list[list[float]]:
+    async def embed_texts(
+        self, texts: list[str], task_type: str = "RETRIEVAL_DOCUMENT"
+    ) -> list[list[float]]:
         return [[0.1] * 768 for _ in texts]
 
     async def generate(self, prompt: str) -> str:
@@ -194,6 +196,30 @@ def test_embed_texts_submits_each_chunk_separately() -> None:
 
     assert asyncio.run(client.embed_texts(["first", "second"])) == [[1.0], [2.0]]
     assert calls == [[["first"]], [["second"]]]
+
+
+def test_embed_texts_forwards_task_type() -> None:
+    configs: list[dict[str, Any]] = []
+
+    class FakeModels:
+        def embed_content(self, **kwargs: Any) -> Any:
+            configs.append(kwargs["config"])
+            return SimpleNamespace(embeddings=[SimpleNamespace(values=[1.0])])
+
+    client = GeminiClient.__new__(GeminiClient)
+    client._settings = SimpleNamespace(gemini_embedding_model="test", gemini_embedding_dimensions=2)
+    client._client = SimpleNamespace(models=FakeModels())
+    client._types = SimpleNamespace(
+        Content=lambda parts: parts,
+        Part=SimpleNamespace(from_text=lambda text: text),
+        EmbedContentConfig=lambda **kwargs: kwargs,
+    )
+
+    # Default is the document task type; the query path overrides it.
+    asyncio.run(client.embed_texts(["doc"]))
+    asyncio.run(client.embed_texts(["query"], task_type="RETRIEVAL_QUERY"))
+    assert configs[0]["task_type"] == "RETRIEVAL_DOCUMENT"
+    assert configs[1]["task_type"] == "RETRIEVAL_QUERY"
 
 
 @pytest.fixture
@@ -230,8 +256,9 @@ def install_fake_genai(monkeypatch: pytest.MonkeyPatch, client_cls: type[Any]) -
             self.parts = parts
 
     class EmbedContentConfig:
-        def __init__(self, output_dimensionality: int) -> None:
+        def __init__(self, output_dimensionality: int, task_type: str = "RETRIEVAL_DOCUMENT") -> None:
             self.output_dimensionality = output_dimensionality
+            self.task_type = task_type
 
     class GenerateContentConfig:
         def __init__(self, **kwargs: Any) -> None:
