@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     history_context_window: int = Field(default=8, ge=0, le=100)
     gemini_temperature: float = Field(default=0.2, ge=0.0, le=2.0)
     generation_context_token_budget: int = Field(default=32_000, ge=1)
+    gemini_max_tool_rounds: int = Field(default=4, ge=1)
     max_upload_bytes: int = Field(default=20 * 1024 * 1024, ge=1, le=20 * 1024 * 1024)
     gcs_bucket_name: str | None = None
     gcs_project_id: str | None = None
