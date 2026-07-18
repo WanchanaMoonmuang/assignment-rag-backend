@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -25,7 +26,7 @@ from app.main import (
     retrieve_chunks,
     validated_content_type,
 )
-from app.rag import GeminiClient
+from app.rag import FALLBACK_ANSWER, GeminiClient
 from app.settings import Settings, get_settings
 from app.worker import build_chunk_documents
 from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt, wait_exponential
@@ -38,8 +39,13 @@ def _is_retryable_gemini_error(exc: BaseException) -> bool:
     # production; 30 sequential eval questions can exhaust the per-minute generate
     # quota just like embed_content did before PR #21, so the harness retries locally.
     from google.genai import errors as genai_errors
+    import httpx
 
-    return isinstance(exc, genai_errors.APIError) and exc.code in _RETRYABLE_STATUS_CODES
+    if isinstance(exc, genai_errors.APIError):
+        return exc.code in _RETRYABLE_STATUS_CODES
+    # Transport-level failures (dropped connections, timeouts) carry no status code
+    # but are just as transient -- one flaky connection shouldn't kill a 30-question run.
+    return isinstance(exc, httpx.TransportError)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_SAMPLES_DIR = REPO_ROOT / "samples"
@@ -164,7 +170,7 @@ async def cleanup_eval_docs(db: Any, settings: Settings, document_ids: list[str]
 
 async def answer_question(
     db: Any, settings: Settings, gemini: GeminiClient, question: str
-) -> tuple[list[str], str]:
+) -> tuple[list[dict[str, Any]], str]:
     chunks = await retrieve_chunks(question, settings.rag_top_k, db, settings, gemini)
     prompt, _ = build_prompt(chunks, question, [], settings.generation_context_token_budget)
     answer = ""
@@ -176,18 +182,64 @@ async def answer_question(
     ):
         with attempt:
             answer, _tool_activity, _usage = await generate_answer(gemini, prompt)
-    return [chunk["content"] for chunk in chunks], answer or ""
+    # Mirror app/main.py's fallback substitution (completed_answer / stream_chat) so the
+    # harness scores exactly what a live chat user would see, not a raw blank string.
+    return chunks, answer or FALLBACK_ANSWER
 
 
 # langchain_google_vertexai builds the API hostname as f"{location}-aiplatform.googleapis.com",
 # which is only valid for concrete regions (e.g. "us-central1"); Vertex multi-region
 # aliases ("us", "eu") instead live at the bare global host, so those need an explicit
-# override or every judge/embedding call gets an "Invalid hostname" 400.
+# override or every judge call gets an "Invalid hostname" 400.
 _MULTI_REGION_ALIASES = {"us", "eu"}
 
 
+class _OneAtATimeVertexEmbeddings:
+    """LangChain-Embeddings-compatible embedder for RAGAS's judge (embed_query /
+    embed_documents only -- that's all ResponseRelevancy calls).
+
+    Not langchain_google_vertexai's VertexAIEmbeddings: its embed_documents()
+    batches every text into a single embedContent call, and this embedding model
+    doesn't reliably support that -- app/rag.py's GeminiClient.embed_texts already
+    embeds one text per call for the same reason ("only supports one content at a
+    time"). The batched call doesn't error, it silently returns embeddings at the
+    wrong dimensionality (observed: 256 instead of the configured 768), which is
+    what made every Answer Relevancy score come back N/A. This mirrors
+    GeminiClient's proven one-request-per-text approach instead.
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        from google import genai
+        from google.genai import types
+
+        self._client = genai.Client(
+            vertexai=True,
+            project=settings.google_cloud_project or settings.gcp_project_id,
+            location=settings.google_cloud_location,
+        )
+        self._types = types
+        self._model = settings.gemini_embedding_model
+        self._dimensions = settings.gemini_embedding_dimensions
+
+    def _embed_one(self, text: str, task_type: str) -> list[float]:
+        result = self._client.models.embed_content(
+            model=self._model,
+            contents=[text],
+            config=self._types.EmbedContentConfig(
+                output_dimensionality=self._dimensions, task_type=task_type
+            ),
+        )
+        return [float(value) for value in result.embeddings[0].values]
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._embed_one(text, "RETRIEVAL_QUERY")
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return [self._embed_one(text, "RETRIEVAL_DOCUMENT") for text in texts]
+
+
 def build_judge(settings: Settings) -> tuple[Any, Any]:
-    from langchain_google_vertexai import ChatVertexAI, VertexAIEmbeddings
+    from langchain_google_vertexai import ChatVertexAI
     from ragas.embeddings import LangchainEmbeddingsWrapper
     from ragas.llms import LangchainLLMWrapper
 
@@ -203,14 +255,7 @@ def build_judge(settings: Settings) -> tuple[Any, Any]:
             temperature=0,
         )
     )
-    embeddings = LangchainEmbeddingsWrapper(
-        VertexAIEmbeddings(
-            model=settings.gemini_embedding_model,
-            project=project,
-            location=location,
-            dimensions=settings.gemini_embedding_dimensions,
-        )
-    )
+    embeddings = LangchainEmbeddingsWrapper(_OneAtATimeVertexEmbeddings(settings))
     return llm, embeddings
 
 
@@ -257,6 +302,61 @@ def run_ragas(
     )
 
 
+# Plain-English descriptions for the RAGAS metrics this harness runs (see run_ragas).
+# Keyed by RAGAS's own output column name; unrecognized future metrics fall back to a
+# title-cased version of their column name with no description (see _metric_label).
+METRIC_INFO: dict[str, tuple[str, str]] = {
+    "faithfulness": (
+        "Faithfulness",
+        "Fraction of claims in the answer that are backed by the retrieved context. "
+        "Low score = the model said something the context doesn't support.",
+    ),
+    "llm_context_precision_with_reference": (
+        "Context Precision",
+        "Fraction of retrieved chunks that were actually relevant to the reference "
+        "answer. Low score = retrieval pulled in noise alongside (or instead of) the "
+        "right chunks.",
+    ),
+    "context_recall": (
+        "Context Recall",
+        "Fraction of the reference answer's claims that could be found in the "
+        "retrieved chunks. Low score = the right chunks weren't retrieved at all.",
+    ),
+    "answer_relevancy": (
+        "Answer Relevancy",
+        "How directly the answer addresses the question itself, independent of "
+        "whether the answer is actually correct.",
+    ),
+}
+
+
+def _metric_label(name: str) -> str:
+    return METRIC_INFO.get(name, (name.replace("_", " ").title(), ""))[0]
+
+
+def _fmt_score(value: Any) -> str:
+    try:
+        if math.isnan(float(value)):
+            return "N/A"
+    except (TypeError, ValueError):
+        return "N/A"
+    return f"{float(value):.3f}"
+
+
+def _escape_cell(text: str) -> str:
+    return str(text).replace("|", "\\|")
+
+
+def _blockquote(text: str) -> str:
+    text = (text or "").strip()
+    if not text:
+        return "> _(no answer generated)_"
+    # Prefix every line so any Markdown the model's own answer contains (headers,
+    # bullets) renders as quoted content instead of colliding with the report's own
+    # heading hierarchy.
+    return "\n".join(f"> {line}" for line in text.splitlines())
+
+
 def write_report(
     rows: list[dict[str, Any]], result: Any, output_dir: Path, settings: Settings
 ) -> Path:
@@ -269,6 +369,7 @@ def write_report(
         "judge_model": settings.eval_judge_model,
         "embedding_model": settings.gemini_embedding_model,
         "embedding_dimensions": settings.gemini_embedding_dimensions,
+        "gemini_max_tool_rounds": settings.gemini_max_tool_rounds,
     }
     retrieval = {
         "rag_top_k": settings.rag_top_k,
@@ -302,6 +403,8 @@ def write_report(
                         "filename": rows[i]["filename"],
                         "question": rows[i]["question"],
                         "answer": rows[i]["answer"],
+                        "sources": rows[i]["sources"],
+                        "source_hit_rate": rows[i]["source_hit_rate"],
                         **{name: frame[name].iloc[i] for name in metric_names},
                     }
                     for i in range(len(rows))
@@ -313,13 +416,15 @@ def write_report(
         encoding="utf-8",
     )
 
-    md_lines = ["# RAGAS eval results", "", "## Models", ""]
+    generated_at = now_utc().strftime("%Y-%m-%d %H:%M:%S UTC")
+    md_lines = ["# RAGAS Evaluation Report", "", f"Generated: {generated_at}", "", "## Models", ""]
     md_lines.append(f"- **Serving model**: {models['serving_model']}")
     md_lines.append(f"- **Judge model**: {models['judge_model']}")
     md_lines.append(
         f"- **Embedding model**: {models['embedding_model']} ({models['embedding_dimensions']} dims)"
     )
-    md_lines += ["", "## Retrieval config", ""]
+    md_lines.append(f"- **Max tool-call rounds**: {models['gemini_max_tool_rounds']}")
+    md_lines += ["", "## Retrieval Configuration", ""]
     md_lines.append(f"- **rag_top_k**: {retrieval['rag_top_k']}")
     md_lines.append(
         f"- **Chunking**: size={retrieval['rag_chunk_size']}, overlap={retrieval['rag_chunk_overlap']}"
@@ -330,23 +435,76 @@ def write_report(
     md_lines.append(
         f"- **Generation context token budget**: {retrieval['generation_context_token_budget']}"
     )
-    md_lines += ["", "## Aggregate scores", ""]
-    for name, value in aggregates.items():
-        md_lines.append(f"- **{name}**: {value:.4f}")
-    md_lines += ["", "## Per-question scores", "", f"| file | question | {' | '.join(metric_names)} |"]
-    md_lines.append(f"|---|---|{'---|' * len(metric_names)}")
-    for i, row in enumerate(rows):
-        scores = " | ".join(f"{frame[name].iloc[i]:.3f}" for name in metric_names)
-        question = row["question"].replace("|", "\\|")
-        md_lines.append(f"| {row['filename']} | {question} | {scores} |")
 
-    md_lines += ["", "## Per-question detail", ""]
-    for i, row in enumerate(rows):
-        scores = ", ".join(f"{name}={frame[name].iloc[i]:.3f}" for name in metric_names)
-        md_lines.append(f"### {row['filename']} — {scores}")
-        md_lines.append(f"**Question:** {row['question']}")
-        md_lines.append(f"**Model's answer:** {row['answer']}")
-        md_lines.append(f"**Ground truth:** {row['ground_truth']}")
+    md_lines += [
+        "",
+        "## Metrics Glossary",
+        "",
+        "All scores are 0.0-1.0 (higher is better). `N/A` means RAGAS could not compute "
+        "that metric for the row (e.g. faithfulness on an empty or no-claim answer).",
+        "",
+        "| Metric | What it measures |",
+        "|---|---|",
+    ]
+    for name in metric_names:
+        description = METRIC_INFO.get(name, (_metric_label(name), "_(undocumented metric)_"))[1]
+        md_lines.append(f"| {_metric_label(name)} | {description} |")
+    md_lines.append(
+        "| Source Hit Rate | _(not a RAGAS metric)_ Fraction of retrieved chunks whose "
+        "source document matches the golden question's own file — a deterministic "
+        "citation check for whether retrieval looked at the right document at all, "
+        "independent of the LLM judge. |"
+    )
+
+    md_lines += ["", "## Aggregate Scores", "", "| Metric | Score |", "|---|---|"]
+    for name, value in aggregates.items():
+        md_lines.append(f"| {_metric_label(name)} | {_fmt_score(value)} |")
+    avg_hit_rate = sum(row["source_hit_rate"] for row in rows) / len(rows) if rows else 0.0
+    md_lines.append(f"| Source Hit Rate | {avg_hit_rate:.3f} |")
+
+    md_lines += [
+        "",
+        "## Summary",
+        "",
+        "Full question, answer, ground truth, and retrieved sources for each row are in "
+        "**Per-Question Detail** below, under the matching `Q#`.",
+        "",
+        f"| # | File | Source Hit Rate | {' | '.join(_metric_label(n) for n in metric_names)} |",
+        f"|---|---|---|{'---|' * len(metric_names)}",
+    ]
+    for i, row in enumerate(rows, start=1):
+        scores = " | ".join(_fmt_score(frame[name].iloc[i - 1]) for name in metric_names)
+        md_lines.append(
+            f"| Q{i} | {_escape_cell(row['filename'])} | {row['source_hit_rate']:.2f} | {scores} |"
+        )
+
+    md_lines += ["", "## Per-Question Detail", ""]
+    for i, row in enumerate(rows, start=1):
+        scores = ", ".join(
+            f"{_metric_label(name)}={_fmt_score(frame[name].iloc[i - 1])}" for name in metric_names
+        )
+        md_lines.append(f"### Q{i} — {row['filename']}")
+        md_lines.append(f"**Scores:** {scores}, Source Hit Rate={row['source_hit_rate']:.2f}")
+        md_lines.append("")
+        if row["sources"]:
+            md_lines.append("**Retrieved sources:**")
+            for source in row["sources"]:
+                hit_mark = "✓" if source["document_name"] == row["filename"] else "✗"
+                score = source.get("score")
+                score_text = f"{score:.3f}" if isinstance(score, (int, float)) else "n/a"
+                location = f" ({source['location']})" if source["location"] else ""
+                md_lines.append(f"- {hit_mark} {source['document_name']}{location} — score={score_text}")
+        else:
+            md_lines.append("**Retrieved sources:** none")
+        md_lines.append("")
+        md_lines.append("**Question:**")
+        md_lines.append(_blockquote(row["question"]))
+        md_lines.append("")
+        md_lines.append("**Model's answer:**")
+        md_lines.append(_blockquote(row["answer"]))
+        md_lines.append("")
+        md_lines.append("**Ground truth:**")
+        md_lines.append(_blockquote(row["ground_truth"]))
         md_lines.append("")
 
     md_path = output_dir / f"{timestamp}.md"
@@ -389,14 +547,29 @@ async def run(args: argparse.Namespace) -> None:
         for filename, golden_rows in golden_set.items():
             for golden_row in golden_rows:
                 print(f"[answer] {filename}: {golden_row['question'][:80]}")
-                contexts, answer = await answer_question(db, settings, gemini, golden_row["question"])
+                chunks, answer = await answer_question(db, settings, gemini, golden_row["question"])
+                # Citations: which document each retrieved chunk actually came from, so a
+                # reader can tell "retrieval missed the source document" apart from
+                # "retrieval hit but the model answered badly" -- deterministic, no judge.
+                sources = [
+                    {
+                        "document_name": chunk["document_name"],
+                        "location": (chunk.get("location") or {}).get("label", ""),
+                        "score": chunk.get("score"),
+                    }
+                    for chunk in chunks
+                ]
+                hits = sum(1 for source in sources if source["document_name"] == filename)
+                source_hit_rate = hits / len(sources) if sources else 0.0
                 rows.append(
                     {
                         "filename": filename,
                         "question": golden_row["question"],
                         "ground_truth": golden_row["ground_truth"],
-                        "contexts": contexts,
+                        "contexts": [chunk["content"] for chunk in chunks],
                         "answer": answer,
+                        "sources": sources,
+                        "source_hit_rate": source_hit_rate,
                     }
                 )
 

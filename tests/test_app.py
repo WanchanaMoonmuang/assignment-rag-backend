@@ -1364,6 +1364,35 @@ def test_get_original_file_returns_private_gcs_bytes(client: TestClient, monkeyp
     assert response.headers["content-type"].startswith("text/plain")
     assert "policy.txt" in response.headers["content-disposition"]
 
+def _calculator_client(models: Any, max_tool_rounds: int = 4) -> GeminiClient:
+    class Part:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
+        @staticmethod
+        def from_function_response(**kwargs: Any) -> dict[str, Any]:
+            return kwargs
+
+        @staticmethod
+        def from_text(**kwargs: Any) -> dict[str, Any]:
+            return kwargs
+
+    client = GeminiClient.__new__(GeminiClient)
+    client._provider = "developer_api"
+    client._settings = SimpleNamespace(
+        gemini_model="test", gemini_temperature=0.2, gemini_max_tool_rounds=max_tool_rounds
+    )
+    client._client = SimpleNamespace(models=models)
+    client._types = SimpleNamespace(
+        FunctionDeclaration=lambda **kwargs: kwargs,
+        Tool=lambda **kwargs: kwargs,
+        GenerateContentConfig=lambda **kwargs: kwargs,
+        Part=Part,
+        Content=lambda **kwargs: kwargs,
+    )
+    return client
+
+
 def test_stream_with_calculator_handles_multiple_calls() -> None:
     calls = [
         SimpleNamespace(name="calculator", args={"expression": "1 + 1"}),
@@ -1379,29 +1408,7 @@ def test_stream_with_calculator_handles_multiple_calls() -> None:
                 return iter([SimpleNamespace(text=None, function_calls=calls, candidates=[candidate])])
             return iter([SimpleNamespace(text="done", function_calls=[])])
 
-    class Part:
-        def __init__(self, **kwargs: Any) -> None:
-            self.kwargs = kwargs
-
-        @staticmethod
-        def from_function_response(**kwargs: Any) -> dict[str, Any]:
-            return kwargs
-
-        @staticmethod
-        def from_text(**kwargs: Any) -> dict[str, Any]:
-            return kwargs
-
-    client = GeminiClient.__new__(GeminiClient)
-    client._provider = "developer_api"
-    client._settings = SimpleNamespace(gemini_model="test", gemini_temperature=0.2)
-    client._client = SimpleNamespace(models=Models())
-    client._types = SimpleNamespace(
-        FunctionDeclaration=lambda **kwargs: kwargs,
-        Tool=lambda **kwargs: kwargs,
-        GenerateContentConfig=lambda **kwargs: kwargs,
-        Part=Part,
-        Content=lambda **kwargs: kwargs,
-    )
+    client = _calculator_client(Models())
 
     async def collect() -> list[tuple[str, Any]]:
         return [item async for item in client.stream_with_calculator("calculate")]
@@ -1420,6 +1427,62 @@ def test_stream_with_calculator_handles_multiple_calls() -> None:
     assert len(model_calls[1]["contents"][2]["parts"]) == 2
 
 
+def test_stream_with_calculator_handles_chained_tool_calls() -> None:
+    # Round 1's follow-up itself requests another calculator call (a real multi-step
+    # question, e.g. "average X for each year, then compare") -- this must not be
+    # silently dropped just because the round-1 follow-up's response has no text.
+    call_1 = SimpleNamespace(name="calculator", args={"expression": "1 + 1"})
+    call_2 = SimpleNamespace(name="calculator", args={"expression": "2 + 2"})
+    model_calls: list[dict[str, Any]] = []
+
+    class Models:
+        def generate_content_stream(self, **kwargs: Any) -> Any:
+            model_calls.append(kwargs)
+            if len(model_calls) == 1:
+                candidate = SimpleNamespace(content=SimpleNamespace(parts=["round-1-content"]))
+                return iter([SimpleNamespace(text=None, function_calls=[call_1], candidates=[candidate])])
+            if len(model_calls) == 2:
+                candidate = SimpleNamespace(content=SimpleNamespace(parts=["round-2-content"]))
+                return iter([SimpleNamespace(text=None, function_calls=[call_2], candidates=[candidate])])
+            return iter([SimpleNamespace(text="Total is 6", function_calls=[])])
+
+    client = _calculator_client(Models())
+
+    async def collect() -> list[tuple[str, Any]]:
+        return [item async for item in client.stream_with_calculator("chained")]
+
+    events = asyncio.run(collect())
+    assert [event for event, _ in events] == [
+        "tool_call", "tool_result", "tool_call", "tool_result", "token",
+    ]
+    assert events[1][1]["display_value"] == "2"
+    assert events[3][1]["display_value"] == "4"
+    assert events[4] == ("token", "Total is 6")
+    assert len(model_calls) == 3
+
+
+def test_stream_with_calculator_stops_at_round_limit() -> None:
+    call = SimpleNamespace(name="calculator", args={"expression": "1 + 1"})
+    model_calls: list[dict[str, Any]] = []
+
+    class Models:
+        def generate_content_stream(self, **kwargs: Any) -> Any:
+            model_calls.append(kwargs)
+            # Never stops requesting the calculator -- the round limit must cut this off
+            # instead of looping forever.
+            candidate = SimpleNamespace(content=SimpleNamespace(parts=["content"]))
+            return iter([SimpleNamespace(text=None, function_calls=[call], candidates=[candidate])])
+
+    client = _calculator_client(Models(), max_tool_rounds=2)
+
+    async def collect() -> list[tuple[str, Any]]:
+        return [item async for item in client.stream_with_calculator("loop forever")]
+
+    events = asyncio.run(collect())
+    assert [event for event, _ in events] == ["tool_call", "tool_result", "tool_call", "tool_result"]
+    assert len(model_calls) == 2
+
+
 def test_generate_with_calculator_reports_activity_and_preserves_model_content() -> None:
     call = SimpleNamespace(name="calculator", args={"expression": "2 + 2"})
     model_content = SimpleNamespace(parts=["original-part-with-thought-signature"])
@@ -1433,29 +1496,7 @@ def test_generate_with_calculator_reports_activity_and_preserves_model_content()
                 return SimpleNamespace(text=None, function_calls=[call], candidates=[candidate])
             return SimpleNamespace(text="4", function_calls=[])
 
-    class Part:
-        def __init__(self, **kwargs: Any) -> None:
-            self.kwargs = kwargs
-
-        @staticmethod
-        def from_function_response(**kwargs: Any) -> dict[str, Any]:
-            return kwargs
-
-        @staticmethod
-        def from_text(**kwargs: Any) -> dict[str, Any]:
-            return kwargs
-
-    client = GeminiClient.__new__(GeminiClient)
-    client._provider = "developer_api"
-    client._settings = SimpleNamespace(gemini_model="test", gemini_temperature=0.2)
-    client._client = SimpleNamespace(models=Models())
-    client._types = SimpleNamespace(
-        FunctionDeclaration=lambda **kwargs: kwargs,
-        Tool=lambda **kwargs: kwargs,
-        GenerateContentConfig=lambda **kwargs: kwargs,
-        Part=Part,
-        Content=lambda **kwargs: kwargs,
-    )
+    client = _calculator_client(Models())
 
     answer, activity, _usage = asyncio.run(client.generate_with_calculator("2 + 2"))
 
@@ -1464,6 +1505,56 @@ def test_generate_with_calculator_reports_activity_and_preserves_model_content()
     # The follow-up must reuse the model's own returned content object (which carries
     # any required thought_signature) rather than rebuilding a function-call Part.
     assert model_calls[1]["contents"][1] is model_content
+
+
+def test_generate_with_calculator_handles_chained_tool_calls() -> None:
+    # Same "needs two sequential calculator calls" scenario as the streaming version
+    # above, for the non-streaming path used by evals/run_eval.py and /api/chat.
+    call_1 = SimpleNamespace(name="calculator", args={"expression": "1 + 1"})
+    call_2 = SimpleNamespace(name="calculator", args={"expression": "2 + 2"})
+    candidate_1 = SimpleNamespace(content=SimpleNamespace(parts=["round-1-content"]))
+    candidate_2 = SimpleNamespace(content=SimpleNamespace(parts=["round-2-content"]))
+    model_calls: list[dict[str, Any]] = []
+
+    class Models:
+        def generate_content(self, **kwargs: Any) -> Any:
+            model_calls.append(kwargs)
+            if len(model_calls) == 1:
+                return SimpleNamespace(text=None, function_calls=[call_1], candidates=[candidate_1])
+            if len(model_calls) == 2:
+                return SimpleNamespace(text=None, function_calls=[call_2], candidates=[candidate_2])
+            return SimpleNamespace(text="Total is 6", function_calls=[])
+
+    client = _calculator_client(Models())
+
+    answer, activity, _usage = asyncio.run(client.generate_with_calculator("1+1, then +2+2"))
+
+    assert answer == "Total is 6"
+    assert activity == [
+        {"name": "calculator", "arguments": {"expression": "1 + 1"}, "result": 2},
+        {"name": "calculator", "arguments": {"expression": "2 + 2"}, "result": 4},
+    ]
+    assert len(model_calls) == 3
+
+
+def test_generate_with_calculator_stops_at_round_limit() -> None:
+    call = SimpleNamespace(name="calculator", args={"expression": "1 + 1"})
+    candidate = SimpleNamespace(content=SimpleNamespace(parts=["content"]))
+    model_calls: list[dict[str, Any]] = []
+
+    class Models:
+        def generate_content(self, **kwargs: Any) -> Any:
+            model_calls.append(kwargs)
+            # Never stops requesting the calculator -- the round limit must cut this off.
+            return SimpleNamespace(text=None, function_calls=[call], candidates=[candidate])
+
+    client = _calculator_client(Models(), max_tool_rounds=2)
+
+    answer, activity, _usage = asyncio.run(client.generate_with_calculator("loop forever"))
+
+    assert answer == ""
+    assert len(activity) == 2
+    assert len(model_calls) == 2
 
 
 def test_chat_emits_redacted_metrics(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
