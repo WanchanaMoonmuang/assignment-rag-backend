@@ -292,107 +292,98 @@ class GeminiClient:
         self, prompt: str
     ) -> tuple[str, list[dict[str, Any]], dict[str, int] | None]:
         config = self._calculator_config()
-        response = await asyncio.to_thread(
-            self._client.models.generate_content,
-            model=self._settings.gemini_model,
-            contents=prompt,
-            config=config,
-        )
-        function_calls = list(getattr(response, "function_calls", None) or [])
-        if not function_calls:
-            return (getattr(response, "text", "") or "").strip(), [], provider_usage(response)
-
+        contents: list[Any] = [
+            self._types.Content(role="user", parts=[self._types.Part.from_text(text=prompt)])
+        ]
         activity: list[dict[str, Any]] = []
-        response_parts = []
-        for function_call in function_calls:
-            part, record = self._calculator_response_part(function_call)
-            response_parts.append(part)
-            activity.append(record)
+        response: Any = None
+        # A multi-step question (e.g. "average X per year, then compare") can need more
+        # than one calculator call in sequence -- the model's follow-up turn may itself
+        # request another call instead of returning final text. Loop (bounded) instead
+        # of assuming one round, or a chained follow-up silently returns empty text.
+        for _ in range(self._settings.gemini_max_tool_rounds):
+            response = await asyncio.to_thread(
+                self._client.models.generate_content,
+                model=self._settings.gemini_model,
+                contents=contents,
+                config=config,
+            )
+            function_calls = list(getattr(response, "function_calls", None) or [])
+            if not function_calls:
+                return (getattr(response, "text", "") or "").strip(), activity, provider_usage(response)
 
-        follow_up = await asyncio.to_thread(
-            self._client.models.generate_content,
-            model=self._settings.gemini_model,
+            response_parts = []
+            for function_call in function_calls:
+                part, record = self._calculator_response_part(function_call)
+                response_parts.append(part)
+                activity.append(record)
+
             # Reuse the model's own returned content (not a hand-built Part) so the
             # required thought_signature on the function-call part is preserved.
-            contents=[
-                self._types.Content(role="user", parts=[self._types.Part.from_text(text=prompt)]),
-                response.candidates[0].content,
-                self._types.Content(role="user", parts=response_parts),
-            ],
-            config=config,
-        )
-        return (getattr(follow_up, "text", "") or "").strip(), activity, provider_usage(follow_up)
+            contents.append(response.candidates[0].content)
+            contents.append(self._types.Content(role="user", parts=response_parts))
+
+        return (getattr(response, "text", "") or "").strip(), activity, provider_usage(response)
 
 
     async def stream_with_calculator(self, prompt: str) -> AsyncIterator[tuple[str, Any]]:
         config = self._calculator_config()
         self._usage_context().set(None)
-        stream = await asyncio.to_thread(
-            self._client.models.generate_content_stream,
-            model=self._settings.gemini_model,
-            contents=prompt,
-            config=config,
-        )
-        function_calls: list[Any] = []
-        call_parts: list[Any] = []
-        while True:
-            chunk = await asyncio.to_thread(_next_or_none, iter(stream))
-            if chunk is None:
-                break
-            usage = provider_usage(chunk)
-            if usage is not None:
-                self._usage_context().set(usage)
-            if getattr(chunk, "text", None):
-                yield "token", chunk.text
-            chunk_calls = getattr(chunk, "function_calls", None) or []
-            if chunk_calls:
-                function_calls.extend(chunk_calls)
-                candidates = getattr(chunk, "candidates", None) or []
-                if candidates and candidates[0].content and candidates[0].content.parts:
-                    # Preserve the model's own parts (incl. thought_signature) rather
-                    # than reconstructing Part(functionCall=...) from scratch.
-                    call_parts.extend(candidates[0].content.parts)
-        if not function_calls:
-            return
-        response_parts = []
-        for function_call in function_calls:
-            yield "tool_call", {"name": function_call.name, "status": "requested"}
-            part, record = self._calculator_response_part(function_call)
-            response_parts.append(part)
-            yield "tool_result", (
-                {
-                    "name": function_call.name,
-                    "arguments": record["arguments"],
-                    "status": "completed",
-                    "display_value": str(record["result"]),
-                }
-                if "result" in record
-                else {
-                    "name": function_call.name,
-                    "arguments": record["arguments"],
-                    "status": "failed",
-                    "display_value": "Calculation failed",
-                }
+        contents: list[Any] = [
+            self._types.Content(role="user", parts=[self._types.Part.from_text(text=prompt)])
+        ]
+        # See generate_with_calculator: a chained follow-up call must also be handled,
+        # bounded, instead of assuming the model is done after one round of tool use.
+        for _ in range(self._settings.gemini_max_tool_rounds):
+            stream = await asyncio.to_thread(
+                self._client.models.generate_content_stream,
+                model=self._settings.gemini_model,
+                contents=contents,
+                config=config,
             )
-        follow_up = await asyncio.to_thread(
-            self._client.models.generate_content_stream,
-            model=self._settings.gemini_model,
-            contents=[
-                self._types.Content(role="user", parts=[self._types.Part.from_text(text=prompt)]),
-                self._types.Content(role="model", parts=call_parts),
-                self._types.Content(role="user", parts=response_parts),
-            ],
-            config=config,
-        )
-        while True:
-            chunk = await asyncio.to_thread(_next_or_none, iter(follow_up))
-            if chunk is None:
-                break
-            usage = provider_usage(chunk)
-            if usage is not None:
-                self._usage_context().set(usage)
-            if getattr(chunk, "text", None):
-                yield "token", chunk.text
+            function_calls: list[Any] = []
+            call_parts: list[Any] = []
+            while True:
+                chunk = await asyncio.to_thread(_next_or_none, iter(stream))
+                if chunk is None:
+                    break
+                usage = provider_usage(chunk)
+                if usage is not None:
+                    self._usage_context().set(usage)
+                if getattr(chunk, "text", None):
+                    yield "token", chunk.text
+                chunk_calls = getattr(chunk, "function_calls", None) or []
+                if chunk_calls:
+                    function_calls.extend(chunk_calls)
+                    candidates = getattr(chunk, "candidates", None) or []
+                    if candidates and candidates[0].content and candidates[0].content.parts:
+                        # Preserve the model's own parts (incl. thought_signature) rather
+                        # than reconstructing Part(functionCall=...) from scratch.
+                        call_parts.extend(candidates[0].content.parts)
+            if not function_calls:
+                return
+            response_parts = []
+            for function_call in function_calls:
+                yield "tool_call", {"name": function_call.name, "status": "requested"}
+                part, record = self._calculator_response_part(function_call)
+                response_parts.append(part)
+                yield "tool_result", (
+                    {
+                        "name": function_call.name,
+                        "arguments": record["arguments"],
+                        "status": "completed",
+                        "display_value": str(record["result"]),
+                    }
+                    if "result" in record
+                    else {
+                        "name": function_call.name,
+                        "arguments": record["arguments"],
+                        "status": "failed",
+                        "display_value": "Calculation failed",
+                    }
+                )
+            contents.append(self._types.Content(role="model", parts=call_parts))
+            contents.append(self._types.Content(role="user", parts=response_parts))
 
 
 

@@ -212,3 +212,65 @@ no test documents were ingested this round (no ingestion changes were in scope f
 batch), so there was nothing to delete via `DELETE /api/documents/{id}`. API and worker
 foreground processes started for this round were killed after use; `/proc` scan confirmed
 no stray `uvicorn`/`app.worker` processes remained.
+
+## 2026-07-18 — Chained calculator tool calls + eval report rewrite (branch: feat/ragas-eval, commit: e89e37c, uncommitted diff)
+
+Environment: live services (MongoDB Atlas, Vertex AI `gemini-3.5-flash` / `gemini-embedding-2`,
+GCS). Checks: `ruff check .` — all checks passed. `pytest` — 73 passed (baseline expectation
+met exactly). `python -m app.check_config` — "Backend config ok".
+
+Scope: uncommitted working-tree diff (not yet committed) touching `app/rag.py`,
+`app/settings.py`, `.env.example`, `evals/run_eval.py`, `tests/test_app.py`, and new
+`evals/test_report.py`. This QA reviewed that diff against the acceptance criteria handed
+down by the coordinator (areas A/B/C below); no code was modified by this QA pass.
+
+### Test cases
+
+| ID | Scenario | Steps / request | Expected | Actual | Status |
+| --- | --- | --- | --- | --- | --- |
+| BQA-045 | A1: new chained/round-limit calculator tests pass | `pytest tests/test_app.py -k calculator -v` | 7 passed, incl. 4 new tests | 7 passed: `test_calculator_supports_safe_math_and_rejects_code`, `test_stream_with_calculator_handles_multiple_calls`, `test_stream_with_calculator_handles_chained_tool_calls`, `test_stream_with_calculator_stops_at_round_limit`, `test_generate_with_calculator_reports_activity_and_preserves_model_content`, `test_generate_with_calculator_handles_chained_tool_calls`, `test_generate_with_calculator_stops_at_round_limit` | PASS |
+| BQA-046 | A1: the 4 new tests are genuine regressions, not tautological | `git stash push -u -- app/rag.py app/settings.py` (reverts to pre-diff single-round logic, keeps new tests), rerun `pytest -k "chained_tool_calls or round_limit"`, then `git stash pop` to restore the fix | all 4 new tests fail against the old single-round code | all 4 failed as expected: chained tests got `answer == ''` instead of the follow-up chained result (old code only reads `.text` off one follow-up, which is empty when that follow-up is itself a function call); round-limit tests recorded only 1 activity entry instead of 2 (no bound loop existed to hit a limit). Stash popped cleanly, `pytest -q` re-confirmed 73 passed afterward | PASS |
+| BQA-047 | A2: round-limit tests prove the loop is actually bounded | Read `test_generate_with_calculator_stops_at_round_limit` / `test_stream_with_calculator_stops_at_round_limit` bodies — mock `Models` never stops returning `function_calls` | asserts `model_calls`/round count == `max_tool_rounds` (2, set explicitly in the test), not just "produces some answer" | confirmed: `assert len(model_calls) == 2` (generate) and `assert len(model_calls) == 2` (stream) with `max_tool_rounds=2` passed into `_calculator_client`; loop terminates instead of looping on an infinite-function-call mock | PASS |
+| BQA-048 | A3: live multi-step calculator question, non-stream `/api/chat` | `POST /api/chat {"question":"What is (12 * 7) + (100 / 4)? ... Show each step."}` (top_k default) | ≥2 chained calculator calls in `tool_activity`, real computed answer, not `FALLBACK_ANSWER` | 200 OK; `tool_activity` shows 3 chained calculator calls (`12 * 7`→84, `100 / 4`→25.0, `84 + 25`→109); answer text states "The final result is **109**." — correct and not the fallback string | PASS |
+| BQA-049 | A3: live multi-step calculator question, SSE `/api/chat/stream` | `POST /api/chat/stream {"question":"What is (18 * 3) + (144 / 12)? ... Show each step."}` | multiple `tool_call`/`tool_result` event pairs, correct final answer via `token` events, terminal `done` | SSE emitted 3 `tool_call`→`tool_result` pairs (`18*3`=54, `144/12`=12.0, `54+12`=66), token stream concluded "The final result is **66**.", followed by `sources` and `done` events | PASS |
+| BQA-050 | A4: existing non-chained/batched-call behavior unchanged | `test_stream_with_calculator_handles_multiple_calls`, `test_generate_with_calculator_reports_activity_and_preserves_model_content` | pass unmodified in behavior (only boilerplate refactored into `_calculator_client` helper) | both pass; diff review confirms only the `Part`/`client` construction boilerplate was extracted into the new `_calculator_client(models, max_tool_rounds=4)` helper — no assertion lines in either test were touched | PASS |
+| BQA-051 | Observability: `chat_metrics` events from the live BQA-048/049 calls carry no prohibited content | Grepped API stdout for `chat_metrics` after both live calls | latency/token fields present, no chat text/answer/document content | confirmed: fields present (`retrieval_ms`, `model_total_ms`, `input_tokens`/`output_tokens`/`total_tokens`, `tool_names: ["calculator","calculator","calculator"]`, `scores`), no answer text, no calculator expression values, no document content in either event | PASS |
+| BQA-052 | B1: `answer_question()` substitutes `FALLBACK_ANSWER` instead of returning blank | Code review: `evals/run_eval.py::answer_question` | `return chunks, answer or FALLBACK_ANSWER` (imported from `app.rag`), mirroring `app/main.py`'s `completed_answer`/`stream_chat` | confirmed present; `FALLBACK_ANSWER = "I could not generate an answer. Please try again."` in `app/rag.py:15` | PASS |
+| BQA-053 | B2: `run()` computes per-row `sources` + deterministic `source_hit_rate` correctly | Code review: `evals/run_eval.py::run()`, the `sources`/`hits`/`source_hit_rate` block | `sources` = one `{document_name, location, score}` dict per retrieved chunk; `source_hit_rate` = fraction of those chunks whose `document_name` equals the golden question's own `filename` key; `0.0` when no chunks retrieved (no div-by-zero) | confirmed correct: `location` reads `chunk.get("location") or {}).get("label", "")` which matches the real chunk shape observed live in BQA-048 (`location: {type, start, end, label}`); `hits = sum(1 for source in sources if source["document_name"] == filename)`; guarded `sources / len(sources) if sources else 0.0` | PASS |
+| BQA-054 | C1: `evals/test_report.py` passes explicitly, and is excluded from the default `pytest` run | `pytest evals/test_report.py -v` and separately `pytest -q` (no `--extra eval`) | `test_report.py` passes on its own; default run (73 tests) unaffected, no pandas import error | `evals/test_report.py::test_write_report_formats_metrics_and_citations` — 1 passed; `pyproject.toml`'s `testpaths = ["tests"]` confirmed to exclude `evals/` from the default collection — default `pytest -q` run (73 passed) does not import pandas via this file | PASS |
+| BQA-055 | C2: `write_report()` output is well-formed Markdown (table columns, escaping, NaN, metric labels, blockquotes) | Ran `write_report()` directly against a synthetic `_FakeResult`/rows fixture (mirroring `evals/test_report.py`, plus one row with a model answer containing `#`/`##`/`\|` to stress the blockquote escaping) and read the generated `.md` and `.json` | header/separator/data table column counts match; no unescaped `\|` breaks table structure; NaN scores render `N/A` never `nan`; metric names are human-readable (`Faithfulness`, `Context Precision`, `Context Recall`, `Source Hit Rate`), not raw RAGAS columns; Model's Answer / Ground Truth are `> `-blockquoted so embedded Markdown headings don't break report structure; JSON output is valid | All confirmed as expected. Summary table header (`\| # \| File \| Source Hit Rate \| Faithfulness \| Context Precision \| Context Recall \|`) and its separator row both have 6 columns; `_fmt_score` correctly renders the injected `math.nan` faithfulness cell as `N/A` and `"nan"` never appears (case-insensitive check); `_metric_label` maps `llm_context_precision_with_reference`→`Context Precision` etc.; Model's Answer text containing `## Fake subheading` and `- bullet \| pipe` rendered fully inside `> `-prefixed blockquote lines, not as live Markdown structure; `.json` output parsed cleanly with `json.tool`. One gap found — see BUG-B-006 below (low severity, pre-existing, out of scope for this diff) | PASS (see BUG-B-006 caveat) |
+| BQA-056 | Full regression sweep for this diff | `ruff check .`, `pytest -q`, `python -m app.check_config` | 0 lint issues, 73 passed, config ok | 0 lint issues; 73 passed (matches the acceptance criteria's expected count exactly, up from the 60-passed baseline mentioned in the general QA brief); `check_config` printed "Backend config ok" | PASS |
+
+### Bugs
+
+- **BUG-B-006** (severity: low, status: open, pre-existing/out-of-scope) — `write_report()`'s
+  per-question `**Question:**` line is not blockquoted or pipe-escaped, unlike the adjacent
+  `Model's Answer`/`Ground Truth` fields that this diff explicitly hardened.
+  - Repro: call `write_report()` with a row whose `question` contains a Markdown heading,
+    e.g. `"What is the total?\n# Injected heading\n| a | b |"` — inspect the generated
+    `.md`; the `# Injected heading` line renders as a live H1 in the output report, and the
+    `| a | b |` renders as stray table-like text outside any table context, both breaking
+    the document's intended heading hierarchy.
+  - Observed: `evals/run_eval.py:463`, `md_lines.append(f"**Question:** {row['question']}")`
+    — no `_blockquote()`/`_escape_cell()` call, unlike the `answer`/`ground_truth` lines
+    a few lines below it.
+  - Suspected root cause: `evals/run_eval.py:463` — this exact line is unchanged from the
+    pre-diff version (`git show HEAD:evals/run_eval.py` has the identical line), so it
+    predates this diff and is not something the current acceptance criteria (which scoped
+    the blockquote hardening specifically to "Model's Answer / Ground Truth") asked to fix.
+    Risk is low in practice since `question` comes from the human-curated golden dataset
+    (`samples/*.json` golden questions), not live model output, but it's the same class of
+    issue the diff otherwise fixed nearby.
+  - Fix / re-verified: pending — hand back only if the coordinator wants Question hardened
+    to match; not blocking for this diff's stated acceptance criteria.
+
+### Cleanup
+
+Live test conversations created by BQA-048/049 were left in MongoDB Atlas (chat text is not
+persisted anywhere in this log, per the redaction rules); no documents were ingested this
+round (out of scope for this diff), so nothing to delete via GCS/`DELETE /api/documents/{id}`.
+API (`uvicorn app.main:app --port 8080`) and worker (`python -m app.worker`) foreground
+processes started for this round were killed after use; `/proc` scan confirmed no stray
+`uvicorn`/`app.worker` processes remained. Scratch files (sample eval report, chat
+response/stream captures, bearer token) were written only to the session scratchpad
+(`/tmp/claude-*/.../scratchpad/`), never into the repo.
